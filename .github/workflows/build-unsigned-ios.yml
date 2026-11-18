@@ -42,6 +42,7 @@ jobs:
 
       - name: Check metadata and adaptive layout
         run: |
+          python3 scripts/test_comment_preload.py
           python3 scripts/test_video_metadata.py
           python3 scripts/test_publication_region.py
           python3 scripts/test_live_adaptive_layout.py

@@ -225,6 +225,7 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
 
     private let startURL: URL
     private var liveContext: DouyinBridge?
+    private let commentFirstPages = DYCommentFirstPageCache()
 
     override convenience init() {
         self.init(startURL: URL(string: "https://www.douyin.com/jingxuan")!)
@@ -258,6 +259,7 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
         }
         #endif
         authorFollowStates = [:]
+        commentFirstPages.clear()
         followSessionCache.invalidate()
         followSession = followSessionCache.generation
         ready = false
@@ -603,6 +605,12 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
         let withStk = p.items.filter { $0.sticker != nil }.count
         if withImg + withStk > 0 { DYLiveModel.log("DDCOMMENTIMG aweme=\(id) n=\(p.items.count) images=\(withImg) stickers=\(withStk)") }
         return (p.items, p.cursor, p.hasMore, p.total)
+    }
+
+    func preparedComments(_ id: String) async throws -> DYCommentFirstPageCache.Page {
+        try await commentFirstPages.page(id) { [self] in
+            try await fetchComments(id, cursor: 0)
+        }
     }
 
     private var liveMaxTime = "0"
@@ -2587,6 +2595,7 @@ struct DYClassicChannelDrag: Equatable {
 
 struct DYVideoPage: View {
     @AppStorage(DDChromeMode.key) private var chromeModeRaw = DDChromeMode.classic.rawValue
+    @Environment(\.dyOfflineVideoPlayback) private var offlinePlayback
     @Environment(\.dySearchCoversVideo) private var searchCoversVideo
     @Environment(\.dyHashtagFilterPresented) private var filterPresented
     @Environment(\.dyStandaloneBack) private var standaloneBack
@@ -2657,6 +2666,11 @@ struct DYVideoPage: View {
             }
         }
         .modifier(DYForwardFeedbackPresentation(bottomInset: insets.bottom, isCurrent: isCurrent))
+        .task(id: isCurrent ? item.id : nil) {
+            guard isCurrent, !Task.isCancelled, offlinePlayback?.inLibrary != true,
+                  DYCommentMemory.shared.take(item.id) == nil, let bridge else { return }
+            _ = try? await bridge.preparedComments(item.id)
+        }
     }
 }
 
@@ -3819,32 +3833,16 @@ struct DYUpstreamVideoPage: View {
         }
     }
 
-    /// 小红书式左下信息区：头像 + 昵称 + 红色「关注」胶囊，下面文案 / 音乐
+    /// 底部保留作者昵称和文案；头像随互动按钮收进侧栏。
     private func info(_ fg: Color) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                Button(action: { if !boost.blocksTap { onAuthor() } }) {
-                    HStack(spacing: 8) {
-                        CachedAsyncImage(url: item.author.avatar.flatMap(URL.init(string:))) { img in
-                            img.resizable().scaledToFill()
-                        } placeholder: { theme.media.chromeFill.color(for: scheme) }
-                        .frame(width: 34, height: 34)
-                        .clipShape(Circle())
-                        .overlay(Circle().stroke(fg.opacity(0.9), lineWidth: 1))
-                        .overlay(alignment: .bottomTrailing) {
-                            // 已关注：绿色对勾；未关注：红色加号。follow_status > 0 即已关注（互关为 2）。
-                            let followed = (item.author.follow ?? 0) > 0
-                            DYAuthorFollowMark(followed: followed)
-                                .offset(x: 3, y: 3)
-                                .accessibilityIdentifier(followed ? "douyin.author.followed" : "douyin.author.notfollowed")
-                        }
-                        Text(item.author.name).font(.subheadline.weight(.semibold)).foregroundStyle(fg).lineLimit(1)
-                    }
-                }
-                .buttonStyle(.plain)
-                .modifier(DYHoldBoost(control: boost))
-                .accessibilityIdentifier("douyin.author")
+            Button(action: { if !boost.blocksTap { onAuthor() } }) {
+                Text("@" + item.author.name)
+                    .font(.subheadline.weight(.semibold)).foregroundStyle(fg).lineLimit(1)
             }
+            .buttonStyle(.plain)
+            .modifier(DYHoldBoost(control: boost))
+            .accessibilityIdentifier("douyin.author")
             DYWorkMetadataText(item: item, active: isCurrent, showsPublication: false)
                 .font(.subheadline)
                 .foregroundStyle(theme.media.onMediaSecondary.color(for: scheme))
@@ -3864,7 +3862,7 @@ struct DYUpstreamVideoPage: View {
         .themeShadow(.mediaLabel)
     }
 
-    /// 小红书式右侧栏：一根竖向液态玻璃胶囊（赞 / 评论 / 收藏 / 搜索，数字在图标下），下方单独一颗「更多」圆按钮
+    /// 右侧栏：一根竖向液态玻璃胶囊（头像 / 赞 / 评论 / 收藏 / 搜索，数字在图标下），下方单独一颗「更多」圆按钮
     @Environment(\.dyRootRailTab) private var rootRailTab
 
     private func actionRail(_ fg: Color, edge: HorizontalEdge) -> some View {
@@ -3879,6 +3877,29 @@ struct DYUpstreamVideoPage: View {
             }
         }
         .padding(.horizontal, hSize == .compact ? 9 : 0)
+    }
+
+    private func authorAvatar(_ fg: Color) -> some View {
+        Button(action: { if !boost.blocksTap { onAuthor() } }) {
+            CachedAsyncImage(url: item.author.avatar.flatMap(URL.init(string:))) { img in
+                img.resizable().scaledToFill()
+            } placeholder: { theme.media.chromeFill.color(for: scheme) }
+            .frame(width: 34, height: 34)
+            .clipShape(Circle())
+            .overlay(Circle().stroke(fg.opacity(0.9), lineWidth: 1))
+            .overlay(alignment: .bottomTrailing) {
+                let followed = (item.author.follow ?? 0) > 0
+                DYAuthorFollowMark(followed: followed)
+                    .offset(x: 3, y: 3)
+                    .accessibilityIdentifier(followed ? "douyin.author.followed" : "douyin.author.notfollowed")
+            }
+            .frame(width: railWidth, height: 44)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .modifier(DYHoldBoost(control: boost))
+        .accessibilityLabel("作者，" + item.author.name)
+        .accessibilityIdentifier("douyin.author.avatar")
     }
 
     private func actions(_ fg: Color) -> some View {
@@ -3906,6 +3927,7 @@ struct DYUpstreamVideoPage: View {
                 .accessibilityIdentifier(backIdentifier)
             }
             VStack(spacing: theme.media.actionItemSpacing) {
+                authorAvatar(fg)
                 railItem(liked ? "heart.fill" : "heart", DYFormat.count(item.stats.digg + (liked ? 1 : 0)),
                          tint: liked ? theme.status.danger.color(for: scheme) : fg, "douyin.like", onLike)
                 railItem("ellipsis.bubble", DYFormat.count(item.stats.comment), tint: fg, "douyin.comments", onComments)
@@ -5429,7 +5451,9 @@ struct DYCommentPanel: View {
         do {
             let first = cursor == 0 && items.isEmpty
             let ins = first ? focus.map { f in [f.parentCid, f.cid].compactMap { $0 }.joined(separator: ",") } : nil
-            let r = try await bridge.fetchComments(aweme.id, cursor: cursor, insert: ins)
+            let r = try await (first && focus == nil
+                ? bridge.preparedComments(aweme.id)
+                : bridge.fetchComments(aweme.id, cursor: cursor, insert: ins))
             let seen = Set(items.map(\.id))
             items.append(contentsOf: r.items.filter { !seen.contains($0.id) })
             if let f = focus, first { applyFocus(f, page: r.items) }
