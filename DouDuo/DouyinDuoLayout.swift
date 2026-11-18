@@ -2,6 +2,7 @@
 // iOS 27.1 用 ArrangementView.overlay（书本：视频 leading、评论 trailing；桌面：视频在上、评论在下）。
 // 更低版本回退容器宽度 wide>=700，不读方向、不读 UIScreen。
 import SwiftUI
+import UIKit
 
 enum DYDuoMetrics {
     /// 合屏竖屏视频左贴边试验；展开内屏与横屏内容不移动。
@@ -393,6 +394,14 @@ enum DYCommentPresentation {
     static func animation(reduceMotion: Bool) -> Animation? {
         reduceMotion ? nil : .smooth(duration: 0.24)
     }
+
+    /// Resign while the input is still mounted. Waiting for the panel's removal
+    /// makes the keyboard begin hiding only after the panel transition finishes.
+    @MainActor static func dismiss(_ close: () -> Void) {
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder),
+                                        to: nil, from: nil, for: nil)
+        close()
+    }
 }
 
 enum DYBottomSheetKind {
@@ -501,6 +510,8 @@ struct DYInlineCommentOverlay: ViewModifier {
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
+    private func close() { DYCommentPresentation.dismiss(onClose) }
+
     func body(content: Content) -> some View {
         content
             .environment(\.dyCommentVideoFrame, placement?.videoFrame)
@@ -512,11 +523,11 @@ struct DYInlineCommentOverlay: ViewModifier {
                     if let placement, let aweme {
                         Color.clear
                             .contentShape(Rectangle())
-                            .onTapGesture(perform: onClose)
+                            .onTapGesture(perform: close)
                             .accessibilityHidden(true)
                         DYEdgePanelSurface(width: placement.panelWidth, height: placement.panelHeight,
                                            isCommentSurface: true,
-                                           onClose: onClose) {
+                                           onClose: close) {
                             DYCommentPanel(bridge: bridge, aweme: aweme, onClose: onClose, focus: focus)
                                 .id(aweme.id)
                         }
@@ -593,6 +604,11 @@ private struct DYEdgeBottomPanel<Panel: View>: View {
     let kind: DYBottomSheetKind
     @ViewBuilder var panel: () -> Panel
 
+    private func close() {
+        if kind == .comments { DYCommentPresentation.dismiss { dismiss() } }
+        else { dismiss() }
+    }
+
     var body: some View {
         GeometryReader { geo in
             let panelHeight: CGFloat = switch kind {
@@ -605,10 +621,10 @@ private struct DYEdgeBottomPanel<Panel: View>: View {
             ZStack(alignment: .bottomTrailing) {
                 Color.clear.ignoresSafeArea()
                     .contentShape(Rectangle())
-                    .onTapGesture { dismiss() }
+                    .onTapGesture(perform: close)
                     .accessibilityHidden(true)
                 DYEdgePanelSurface(width: panelWidth, height: panelHeight,
-                                   isCommentSurface: kind == .comments, onClose: { dismiss() }) {
+                                   isCommentSurface: kind == .comments, onClose: close) {
                     panel()
                         .onPreferenceChange(DYBottomPanelContentHeightKey.self) { height in
                             if height > 0 { contentHeight = height }

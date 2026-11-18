@@ -4604,6 +4604,15 @@ struct DYCommentPanel: View {
         self.focus = focus?.awemeID == aweme.id ? focus : nil
     }
 
+    private var dismissComments: (() -> Void)? {
+        onClose.map { close in
+            {
+                inputFocused = false
+                DYCommentPresentation.dismiss(close)
+            }
+        }
+    }
+
     @Environment(\.dyExpandedCaptionID) private var expandedCaptionID
     private var showsCaption: Bool { usesClassicComments && expandedCaptionID == aweme.id }
 
@@ -4613,7 +4622,7 @@ struct DYCommentPanel: View {
 
     private var captionHeader: some View {
         VStack(spacing: 0) {
-            DYVideoCaptionHeader(bridge: bridge, aweme: aweme, onClose: onClose,
+            DYVideoCaptionHeader(bridge: bridge, aweme: aweme, onClose: dismissComments,
                                  authorTrailingInset: max(0, headerTrailingInset - trailingInset),
                                  closeAtLeading: horizontalStatus,
                                  stacksAuthorInfo: horizontalStatus)
@@ -4632,8 +4641,8 @@ struct DYCommentPanel: View {
 
     @ViewBuilder
     private var closeButton: some View {
-        if !showsCaption, let onClose {
-            Button(action: onClose) {
+        if !showsCaption, let close = dismissComments {
+            Button(action: close) {
                 Image(systemName: "xmark").font(.subheadline.weight(.semibold))
                     .frame(width: 44, height: 44)
                     .contentShape(Rectangle())
@@ -4694,7 +4703,7 @@ struct DYCommentPanel: View {
         }
         .foregroundStyle(.themeTextPrimary)
         .contentShape(Rectangle())
-        .modifier(DYPanelDismissGesture(allowsSwipeRight: true, onClose: onClose))
+        .modifier(DYPanelDismissGesture(allowsSwipeRight: true, onClose: dismissComments))
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("douyin.comments.header")
     }
@@ -4715,8 +4724,8 @@ struct DYCommentPanel: View {
                 Text(total > 0 ? "\(DYFormat.count(total)) 条评论" : "评论").font(.subheadline.weight(.semibold))
                     .accessibilityIdentifier("douyin.comments.title")
                 Spacer()
-                if let onClose {
-                    Button(action: onClose) { Image(systemName: "xmark").font(.subheadline.weight(.semibold)) }
+                if let close = dismissComments {
+                    Button(action: close) { Image(systemName: "xmark").font(.subheadline.weight(.semibold)) }
                         .buttonStyle(.plain)
                         .accessibilityIdentifier("douyin.comments.close")
                 }
@@ -4864,7 +4873,7 @@ struct DYCommentPanel: View {
                 }
                 .clipped()
                 .modifier(DYScrollTopObserver(atTop: $listAtTop))
-                .modifier(DYPanelDismissGesture(isAtTop: listAtTop, allowsSwipeRight: true, onClose: onClose))
+                .modifier(DYPanelDismissGesture(isAtTop: listAtTop, allowsSwipeRight: true, onClose: dismissComments))
                 .accessibilityIdentifier("douyin.comments.list")
                 .modifier(DYCommentTopTracker(ids: items.map(\.id), top: $topVisibleID, paused: restoringScroll))
                 .task(id: pendingRestoreID) {
@@ -4946,7 +4955,7 @@ struct DYCommentPanel: View {
 
     private func searchRelated(_ word: String) {
         guard let openSearch else { relatedQuery = DYRelatedQuery(word: word); return }
-        onClose?()
+        dismissComments?()
         // Let a compact comment sheet dismiss before the video host presents search.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { openSearch(word) }
     }
