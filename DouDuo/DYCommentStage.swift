@@ -34,6 +34,7 @@ struct DYCommentStage<Feed: View, Author: View>: View {
 
     @Environment(\.appTheme) private var theme
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         let authorOpen = authorPane?.id != nil
@@ -88,7 +89,8 @@ struct DYCommentStage<Feed: View, Author: View>: View {
         }
         .background((layout.resident ? Color.black : theme.media.strongScrim.color(for: scheme)).ignoresSafeArea())
         .animation(showSearch ? nil : .snappy, value: layout.resident)
-        .animation(!showSearch && layout.sideBySide ? .snappy : nil, value: showComments)
+        .animation(!showSearch && layout.sideBySide ? DYCommentPresentation.animation(reduceMotion: reduceMotion) : nil,
+                   value: showComments)
         .animation(showSearch ? nil : .snappy, value: authorPane?.id)
         .modifier(DYInlineCommentOverlay(placement: placement, bridge: bridge, aweme: aweme,
                                          onClose: { showComments = false }))

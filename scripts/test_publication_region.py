@@ -50,11 +50,11 @@ print("PASS old sessions preserve metadata and decode missing regions")
             subprocess.run(['swiftc',str(tmp/'main.swift'),'-o',str(tmp/'test')],check=True,timeout=120)
             subprocess.run([str(tmp/'test'),str(tmp/'item.json')],check=True,timeout=30)
 
-    def test_default_display_and_upstream_integration(self):
+    def test_footer_hides_publication_and_details_keep_metadata(self):
         settings = (ROOT/'DouDuo/DYSettingsScreen.swift').read_text()
         self.assertNotIn('显示国内发布地', settings)
         view = (ROOT/'DouDuo/DYWorkMetadataText.swift').read_text()
-        self.assertIn('guard place == nil',view)
+        self.assertIn('guard showsPublication, place == nil',view)
         self.assertNotIn('@AppStorage',view)
         self.assertIn('DYPublicationRegionClient.shared.cached(item.id)',view)
         self.assertIn('guard !Task.isCancelled',view)
@@ -63,7 +63,7 @@ print("PASS old sessions preserve metadata and decode missing regions")
         host = (ROOT/'DouDuo/DYRecommendFeedHost.swift').read_text()
         self.assertIn('ahead.prefix(2)',host)
         self.assertIn('DYPublicationRegionClient.shared.prefetch(regionIDs)',host)
-        self.assertEqual(SOURCE.read_text().count('DYWorkMetadataText(item: item, active: isCurrent)'),2)
+        self.assertEqual(SOURCE.read_text().count('DYWorkMetadataText(item: item, active: isCurrent, showsPublication: false)'),2)
         self.assertIn('DYWorkMetadataText(item: aweme, active: true)',(ROOT/'DouDuo/DouyinExpandableTitle.swift').read_text())
         # 只确认版本号键存在且是 x.y 或 x.y.z（带不带引号都行），不写死某个版本，升版本时不用再改这条
         import re

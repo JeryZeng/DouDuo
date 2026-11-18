@@ -388,6 +388,13 @@ enum DYReservedNudge {
 
 // MARK: - Shared comments presentation
 
+enum DYCommentPresentation {
+    /// Keep comments responsive without the default spring's long settling tail.
+    static func animation(reduceMotion: Bool) -> Animation? {
+        reduceMotion ? nil : .smooth(duration: 0.24)
+    }
+}
+
 enum DYBottomSheetKind {
     case comments, share, options
 }
@@ -508,6 +515,7 @@ struct DYInlineCommentOverlay: ViewModifier {
                             .onTapGesture(perform: onClose)
                             .accessibilityHidden(true)
                         DYEdgePanelSurface(width: placement.panelWidth, height: placement.panelHeight,
+                                           isCommentSurface: true,
                                            onClose: onClose) {
                             DYCommentPanel(bridge: bridge, aweme: aweme, onClose: onClose, focus: focus)
                                 .id(aweme.id)
@@ -517,7 +525,7 @@ struct DYInlineCommentOverlay: ViewModifier {
                         .accessibilityAddTraits(.isModal)
                     }
                 }
-                .animation(reduceMotion ? nil : .snappy, value: placement != nil)
+                .animation(DYCommentPresentation.animation(reduceMotion: reduceMotion), value: placement != nil)
             }
     }
 }
@@ -599,7 +607,8 @@ private struct DYEdgeBottomPanel<Panel: View>: View {
                     .contentShape(Rectangle())
                     .onTapGesture { dismiss() }
                     .accessibilityHidden(true)
-                DYEdgePanelSurface(width: panelWidth, height: panelHeight, onClose: { dismiss() }) {
+                DYEdgePanelSurface(width: panelWidth, height: panelHeight,
+                                   isCommentSurface: kind == .comments, onClose: { dismiss() }) {
                     panel()
                         .onPreferenceChange(DYBottomPanelContentHeightKey.self) { height in
                             if height > 0 { contentHeight = height }
@@ -615,9 +624,11 @@ private struct DYEdgeBottomPanel<Panel: View>: View {
 
 private struct DYEdgePanelSurface<Panel: View>: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @State private var dragOffset: CGFloat = 0
     let width: CGFloat
     let height: CGFloat
+    var isCommentSurface = false
     let onClose: () -> Void
     @ViewBuilder var panel: () -> Panel
 
@@ -637,6 +648,11 @@ private struct DYEdgePanelSurface<Panel: View>: View {
                 }))
         }
         .frame(width: width, height: height, alignment: .top)
+        .background {
+            if isCommentSurface {
+                shape.fill(Color.ddBackground.opacity(reduceTransparency ? 1 : DDTheme.commentSurfaceOpacity))
+            }
+        }
         .dyPanelGlass(in: shape)
         .clipShape(shape)
         .offset(y: dragOffset)
@@ -743,6 +759,7 @@ struct DYCommentPlayerLayout<Video: View>: View {
     @Environment(\.dyStacksLandscapeComments) private var stacksLandscapeComments
     @Environment(\.dyDuoLandscapeWindow) private var duoLandscapeWindow
     @Environment(\.dyHingeClosed) private var hingeClosed
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ViewBuilder var video: (EdgeInsets) -> Video
 
     private var usesClassicLayout: Bool {
@@ -845,7 +862,8 @@ struct DYCommentPlayerLayout<Video: View>: View {
             .onChange(of: layout.resident && layout.sideBySide, initial: true) { _, bookFold in
                 bookFoldComments = bookFold
             }
-            .animation(!searchPresented && layout.sideBySide ? .snappy : nil, value: showComments)
+            .animation(!searchPresented && layout.sideBySide ? DYCommentPresentation.animation(reduceMotion: reduceMotion) : nil,
+                       value: showComments)
             .animation(searchPresented ? nil : .snappy, value: layout.resident)
             .modifier(DYInlineCommentOverlay(placement: placement, bridge: bridge, aweme: commentItem,
                                              focus: focus, onClose: { showComments = false }))

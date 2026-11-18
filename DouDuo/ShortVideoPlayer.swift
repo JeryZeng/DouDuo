@@ -544,7 +544,7 @@ struct PlayerPage: View {
                     .frame(width: geometry.size.width, height: geometry.size.height)
                     .scaleEffect(placement.scale)
                     .offset(x: placement.offset.width, y: placement.offset.height)
-                    .animation(commentReduceMotion ? nil : .snappy, value: showsVideoAboveComments)
+                    .animation(DYCommentPresentation.animation(reduceMotion: commentReduceMotion), value: showsVideoAboveComments)
                     .allowsHitTesting(false)
                 }
             } else {
@@ -572,7 +572,7 @@ struct PlayerPage: View {
                                                            videoAspect: videoAspect, fills: fillsVideoPlane))
                     .scaleEffect(lift.scale)
                     .offset(x: lift.offset.width, y: lift.offset.height)
-                    .animation(commentReduceMotion ? nil : .snappy, value: showsVideoAboveComments)
+                    .animation(DYCommentPresentation.animation(reduceMotion: commentReduceMotion), value: showsVideoAboveComments)
                 }
             }
             if !cleanScreen && isActive && (!danmaku.isEmpty || dmStress) {

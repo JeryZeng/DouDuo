@@ -14,6 +14,8 @@ enum DDFontSize { case caption, body, headline, title, displayLarge, splash }
 struct DDTheme {
     static let sheetCornerRadius: CGFloat = 32
     static let shareSheetHeight: CGFloat = 300
+    static let commentSurfaceOpacity: Double = 0.88
+    static let videoInfoBottomPadding: CGFloat = 12
 
     struct Media {
         let scrim = DDColor(.black.opacity(0.35))

@@ -1,9 +1,10 @@
 import SwiftUI
 
-/// Retains upstream time/AI text and styling; metadata never blocks playback.
+/// The video footer keeps AI declarations; expanded details can also show publication metadata.
 struct DYWorkMetadataText: View {
     let item: DYAweme
     let active: Bool
+    var showsPublication = true
     @State private var recovered: (id: String, city: String?, country: String?)?
     private struct Key: Hashable {
         let id: String; let active: Bool
@@ -18,14 +19,19 @@ struct DYWorkMetadataText: View {
             ?? DYPublicationRegion.name(for: cached?.city, country: cached?.country)
         // Missing web metadata is not a confirmed unknown: show the region once resolved.
         Group {
-            if let text = DYPublicationRegion.metadata(item.metadataText(), place: place, resolved: stored != nil || cached != nil) {
+            if showsPublication,
+               let text = DYPublicationRegion.metadata(item.metadataText(), place: place, resolved: stored != nil || cached != nil) {
                 Text(text).accessibilityIdentifier("douyin.video.metadata")
+            } else if !showsPublication,
+                      let declaration = item.aiDeclaration?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !declaration.isEmpty {
+                Text(declaration).accessibilityIdentifier("douyin.video.metadata")
             }
         }
         .task(id: Key(id: item.id, active: active,
                       city: item.publicationCityCode, country: item.publicationCountry)) {
             // Lazy-mounted neighbouring pages prepare their metadata before becoming current.
-            guard place == nil else { return }
+            guard showsPublication, place == nil else { return }
             let result = await DYPublicationRegionClient.shared.lookup(item.id)
             guard !Task.isCancelled else { return }
             recovered = (item.id, result.city, result.country)

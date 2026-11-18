@@ -2368,7 +2368,7 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
                            onLike: { toggleLike(item.id, force: nil) },
                            onCollect: { toggleCollect(item.id) },
                            onDoubleTap: { toggleLike(item.id, force: true) },
-                           onComments: { withAnimation(.snappy) { showComments.toggle() } },
+                           onComments: { showComments.toggle() },
                            onSearch: { openSearch() },
                            onAuthor: { authorTarget = item.author },
                            onSavePosition: { resume[item.id] = $0; saveSession() },
@@ -3738,6 +3738,9 @@ struct DYUpstreamVideoPage: View {
                 // 默认：PR #12 之前的布局，左下信息 + 右侧按钮栏
                 HStack(alignment: .bottom, spacing: 12) {
                     info(fg)
+                        .padding(.bottom, item.images.isEmpty
+                                 ? DYDuoMetrics.mediaBottomPadding(insets.bottom) + DDTheme.videoInfoBottomPadding
+                                 : max(insets.bottom, 18) + 24)
                     Spacer(minLength: 0)
                     actions(fg)
                         .offset(x: DYDuoMetrics.actionRailHorizontalOffset(
@@ -3747,9 +3750,9 @@ struct DYUpstreamVideoPage: View {
                         .modifier(DYRailReservedNudge())
                         .offset(x: hSize == .compact ? -9 : 0)
                         .padding(.bottom, item.images.isEmpty ? 56 : 0)
+                        .padding(.bottom, max(insets.bottom, 18) + (item.images.isEmpty ? 36 : 24))
                 }
                 .padding(.horizontal, chromeSidePadding)
-                .padding(.bottom, max(insets.bottom, 18) + (item.images.isEmpty ? 36 : 24))
                 .opacity(boost.boosting ? 0 : 1)
                 .animation(.easeOut(duration: 0.15), value: boost.boosting)
             }
@@ -3842,7 +3845,7 @@ struct DYUpstreamVideoPage: View {
                 .modifier(DYHoldBoost(control: boost))
                 .accessibilityIdentifier("douyin.author")
             }
-            DYWorkMetadataText(item: item, active: isCurrent)
+            DYWorkMetadataText(item: item, active: isCurrent, showsPublication: false)
                 .font(.subheadline)
                 .foregroundStyle(theme.media.onMediaSecondary.color(for: scheme))
                 .lineLimit(2)
@@ -4239,7 +4242,8 @@ struct DYClassicVideoPage: View {
                 info(fg)
                     .padding(.horizontal, chromeSidePadding)
                     .padding(contentInsets)
-                    .padding(.bottom, DYDuoMetrics.mediaBottomPadding(mediaBottomInset) + (item.images.isEmpty ? 16 * ui : 16))
+                    .padding(.bottom, DYDuoMetrics.mediaBottomPadding(mediaBottomInset)
+                             + (item.images.isEmpty ? DDTheme.videoInfoBottomPadding * ui : 16))
             }
         }
         .overlay(alignment: .trailing) {
@@ -4333,7 +4337,7 @@ struct DYClassicVideoPage: View {
                                   secondary: fg.opacity(0.7), hashtagNames: item.hashtagNames ?? [],
                                   onExpand: expandVideoCaption.map { open in { open(item) } })
             }
-            DYWorkMetadataText(item: item, active: isCurrent)
+            DYWorkMetadataText(item: item, active: isCurrent, showsPublication: false)
                 .font(.caption2.weight(.regular))
                 .foregroundStyle(fg.opacity(0.62))
                 .lineLimit(2).fixedSize(horizontal: false, vertical: true)
