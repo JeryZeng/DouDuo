@@ -522,21 +522,19 @@ struct PlayerPage: View {
             }
             if usesClassicVideoLayout {
                 GeometryReader { geometry in
-                    let fitted = DYVideoFit.contentSize(container: geometry.size, videoAspect: videoAspect,
-                                                       fillWidth: fillsVideoPlane)
+                    let contentFrame = DYVideoFit.contentFrame(container: geometry.size, videoAspect: videoAspect,
+                                                              fillWidth: fillsVideoPlane)
                     let placement = showsVideoAboveComments
-                        ? DYVideoFit.commentPlacement(viewport: geometry.frame(in: .global), fitted: fitted, target: commentVideoFrame)
+                        ? DYVideoFit.commentPlacement(viewport: geometry.frame(in: .global), fitted: contentFrame.size, target: commentVideoFrame)
                         : (scale: CGFloat(1), offset: CGSize.zero)
                     ZStack {
                         videoPlane
                             .mask {
                                 Rectangle()
-                                    .frame(width: fitted.width, height: fitted.height)
-                                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                    .frame(width: contentFrame.width, height: contentFrame.height)
+                                    .position(x: contentFrame.midX, y: contentFrame.midY)
                             }
                             .scaleEffect(showsVideoAboveComments ? 1 : videoScale)
-                            .modifier(DYClosedPortraitAlignment(viewport: geometry.size,
-                                                               videoAspect: videoAspect, fills: fillsVideoPlane))
                         if !cleanScreen && isActive && !isPlaying && (player != nil || vlc != nil) && !seeking {
                             Image(systemName: "play.fill").font(.system(size: 52 * ui)).foregroundStyle(.white.opacity(0.75))
                         }
@@ -559,17 +557,15 @@ struct PlayerPage: View {
                     videoPlane
                     .mask {
                     GeometryReader { geometry in
-                        let fitted = DYVideoFit.contentSize(container: geometry.size, videoAspect: videoAspect, fillWidth: fillsVideoPlane)
+                        let contentFrame = DYVideoFit.contentFrame(container: geometry.size, videoAspect: videoAspect,
+                                                                  fillWidth: fillsVideoPlane)
                         Rectangle()
-                            .frame(width: fitted.width, height: fitted.height)
-                            .position(x: geometry.size.width / 2, y: geometry.size.height / 2)
+                            .frame(width: contentFrame.width, height: contentFrame.height)
+                            .position(x: contentFrame.midX, y: contentFrame.midY)
                     }
                     }
                     .scaleEffect(showsVideoAboveComments ? 1 : videoScale)
                     .allowsHitTesting(false)
-                        // 仅系统铰链 closed 时左贴边；展开、半折、分屏均保持原来的居中。
-                        .modifier(DYClosedPortraitAlignment(viewport: outer.size,
-                                                           videoAspect: videoAspect, fills: fillsVideoPlane))
                     .scaleEffect(lift.scale)
                     .offset(x: lift.offset.width, y: lift.offset.height)
                     .animation(DYCommentPresentation.animation(reduceMotion: commentReduceMotion), value: showsVideoAboveComments)

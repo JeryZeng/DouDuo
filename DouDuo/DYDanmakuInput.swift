@@ -16,6 +16,9 @@ final class DYDanmakuModel: ObservableObject {
     func load(_ item: DYAweme, isCurrent: Bool, bridge: DouyinBridge?) async {
         guard isCurrent, !loaded, item.images.isEmpty, let b = bridge else { return }
         loaded = true
+        // Shared cached resources load alongside the stream, without waiting
+        // for the user to open the comment panel or delaying the first danmaku.
+        Task { await DYEmojiStore.shared.load(bridge: b) }
         // 接口单次只能拿到约 30 秒的弹幕，长视频按 60 秒窗口边拉边显示
         for await chunk in b.danmakuStream(item.id, durationMs: Int(item.duration * 1000)) {
             items = DYDanmaku.merged(items, chunk)

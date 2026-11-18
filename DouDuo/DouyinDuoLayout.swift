@@ -5,15 +5,6 @@ import SwiftUI
 import UIKit
 
 enum DYDuoMetrics {
-    /// 合屏竖屏视频左贴边试验；展开内屏与横屏内容不移动。
-    static func closedPortraitVideoOffset(viewport: CGSize, videoAspect: Double,
-                                          fills: Bool, isDuo: Bool, isClosed: Bool) -> CGFloat {
-        guard isDuo, isClosed, viewport.height > viewport.width,
-              videoAspect > 0, videoAspect < 1, !fills else { return 0 }
-        let fittedWidth = min(viewport.width, viewport.height * videoAspect)
-        return -(viewport.width - fittedWidth) / 2
-    }
-
     static func hingeSplit(_ geo: GeometryProxy) -> (video: CGRect, panel: CGRect, book: Bool)? {
         guard DYDuoMetrics.foldIsActive(geo) else { return nil }
         guard #available(iOS 27.1, *) else { return nil }
@@ -939,21 +930,6 @@ struct DYScrollTopObserver: ViewModifier {
             // must never dismiss a panel without reliable scroll-position data.
             content.onAppear { atTop = false }
         }
-    }
-}
-
-/// 只在系统确认铰链 closed 时启用左贴边；不能拿窄视频窗格宽度猜外屏。
-/// 铰链状态由根视图 `DYHingeStateRoot` 统一读取后经环境下发：
-/// `onHingeChange` 只在状态「变化」时回调，而且只回给当时已经在屏上的那一个视图——
-/// 以前每个视频页各挂一份，只有启动时第一页收到 closed，往后滑出来的新页永远停在默认 false（居中）。
-struct DYClosedPortraitAlignment: ViewModifier {
-    @Environment(\.dyHingeClosed) private var hingeClosed
-    let viewport: CGSize
-    let videoAspect: Double
-    let fills: Bool
-    func body(content: Content) -> some View {
-        content.offset(x: DYDuoMetrics.closedPortraitVideoOffset(viewport: viewport, videoAspect: videoAspect,
-                       fills: fills, isDuo: DYDuoMetrics.isDuoHardware, isClosed: hingeClosed))
     }
 }
 

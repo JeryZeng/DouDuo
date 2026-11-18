@@ -4822,7 +4822,7 @@ final class DouDuoUITests: XCTestCase {
         }
     }
 
-    /// 合屏左贴边探针：连滑几条，看每页是否都收到铰链回调（日志 DDHINGE）
+    /// 外屏居中探针：关闭铺满后连滑几条，检查不同视频比例的留边。
     func testClosedAlignProbe() throws {
         let app = XCUIApplication()
         app.launchArguments += ["-douyin_muted_v1", "YES", "-douyin_autofit_v1", "NO"]

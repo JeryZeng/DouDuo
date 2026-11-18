@@ -5370,9 +5370,11 @@ struct DYCommentPanel: View {
             if replyErr[c.id] != nil {
                 Button { replyErr[c.id] = nil; Task { await loadReplies(c) } } label: {
                     Text("回复加载失败，点此重试").font(.caption).foregroundStyle(.themeTextSecondary)
+                        .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .padding(.top, 12)
+                .accessibilityIdentifier("douyin.replies.retry")
             } else if replies[c.id] == nil || (replyMore[c.id] ?? false) {
                 Button { Task { await loadReplies(c) } } label: {
                     HStack(spacing: 6) {
@@ -5381,10 +5383,13 @@ struct DYCommentPanel: View {
                         if replyLoading.contains(c.id) { ProgressView().controlSize(.mini) }
                     }
                     .font(.caption.weight(.medium)).foregroundStyle(.themeTextSecondary)
+                    // The whole row, including its whitespace, expands replies.
+                    // Keep this hit area inside the label so it cannot overlap
+                    // the neighboring comment's tap-to-reply gesture.
+                    .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                // 和上方回复拉开距离，避免误点到回复评论
-                .padding(.top, 12)
                 .accessibilityIdentifier("douyin.replies")
             }
         }
@@ -5568,26 +5573,18 @@ struct DYCommentImageViewer: View {
     @State private var page = 0
 
     var body: some View {
-        ZStack(alignment: .topTrailing) {
+        ZStack {
             Color.ddBackground.ignoresSafeArea()
             TabView(selection: $page) {
                 ForEach(Array(target.images.enumerated()), id: \.offset) { i, img in
-                    CachedAsyncImage(url: URL(string: img.full)) { v in v.resizable().scaledToFit() }
-                        placeholder: { ProgressView().tint(.white) }
+                    DYCommentZoomImage(source: img, onDismiss: { dismiss() })
                         .tag(i)
                 }
             }
             .tabViewStyle(.page(indexDisplayMode: target.images.count > 1 ? .always : .never))
             .ignoresSafeArea()
-            .onTapGesture { dismiss() }
-            Button { dismiss() } label: {
-                Image(systemName: "xmark").font(.headline.weight(.semibold)).foregroundStyle(.white)
-                    .frame(width: 44, height: 44).background(Circle().fill(.black.opacity(0.4)))
-            }
-            .padding(16)
-            .accessibilityIdentifier("douyin.comment.viewer.close")
         }
-        .dyEdgeBack { dismiss() }
+        .accessibilityIdentifier("douyin.comment.viewer")
         .onAppear { page = target.start }
     }
 }

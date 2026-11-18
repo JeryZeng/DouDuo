@@ -59,6 +59,7 @@ final class DYDanmakuEngineView: UIView {
     private var pool: [CALayer] = []
     private var images: [String: CGImage] = [:]
     private var sizes: [String: CGSize] = [:]
+    private var emojiImageCount = 0
     private var lastShown: [String: Double] = [:]   // 去重：同文本 10s 内不重复
     private var link: CADisplayLink?
     private var clock = DYDanmakuClock()
@@ -84,7 +85,13 @@ final class DYDanmakuEngineView: UIView {
     required init?(coder: NSCoder) { fatalError() }
 
     func update(items: [DYDanmaku], clock c: DYDanmakuClock, regionTop: CGFloat, regionHeight: CGFloat,
-                lanes l: Int, density: DYDanmakuPolicy.Density, deduplicate dd: Bool) {
+                lanes l: Int, density: DYDanmakuPolicy.Density, deduplicate dd: Bool, emojiCount: Int) {
+        if emojiImageCount != emojiCount {
+            emojiImageCount = emojiCount
+            images.removeAll(); sizes.removeAll()
+            // Existing flying layers keep their original width and texture;
+            // upcoming/replayed items use the newly available emoji images.
+        }
         let jumped = c.epoch != clock.epoch
         clock = c
         lanes = l
@@ -255,14 +262,14 @@ final class DYDanmakuEngineView: UIView {
         let attrs: [NSAttributedString.Key: Any] = [
             .font: font, .foregroundColor: UIColor.white.withAlphaComponent(0.95), .shadow: shadow,
         ]
-        let text = d.text as NSString
-        let size = text.size(withAttributes: attrs)
+        let text = DYEmojiStore.shared.attributed(d.text, font: font, attributes: attrs)
+        let size = text.size()
         let pad: CGFloat = 3
         let box = CGSize(width: ceil(size.width) + pad * 2, height: ceil(size.height) + pad * 2)
         let fmt = UIGraphicsImageRendererFormat.preferred()
         fmt.opaque = false
         let img = UIGraphicsImageRenderer(size: box, format: fmt).image { _ in
-            text.draw(at: CGPoint(x: pad, y: pad), withAttributes: attrs)
+            text.draw(at: CGPoint(x: pad, y: pad))
         }
         images[d.id] = img.cgImage
         sizes[d.id] = box
@@ -281,6 +288,7 @@ private final class DYDanmakuEngineTick: NSObject {
 }
 
 struct DYDanmakuLiveSurface: UIViewRepresentable {
+    @ObservedObject private var emojiStore = DYEmojiStore.shared
     let items: [DYDanmaku]
     let clock: DYDanmakuClock
     let regionTop: CGFloat
@@ -292,7 +300,7 @@ struct DYDanmakuLiveSurface: UIViewRepresentable {
     func makeUIView(context: Context) -> DYDanmakuEngineView { DYDanmakuEngineView() }
     func updateUIView(_ v: DYDanmakuEngineView, context: Context) {
         v.update(items: items, clock: clock, regionTop: regionTop, regionHeight: regionHeight,
-                 lanes: lanes, density: density, deduplicate: deduplicate)
+                 lanes: lanes, density: density, deduplicate: deduplicate, emojiCount: emojiStore.images.count)
     }
     static func dismantleUIView(_ v: DYDanmakuEngineView, coordinator: ()) { v.stop() }
 }

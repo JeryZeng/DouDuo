@@ -88,6 +88,15 @@ enum DYVideoFit {
         return CGSize(width: container.height * aspect, height: container.height)
     }
 
+    /// Both playback renderers use the same centered mask, including very tall
+    /// videos on the outer display. Folding never changes media alignment.
+    static func contentFrame(container: CGSize, videoAspect: Double, fillWidth: Bool) -> CGRect {
+        let size = contentSize(container: container, videoAspect: videoAspect, fillWidth: fillWidth)
+        return CGRect(x: (container.width - size.width) / 2,
+                      y: (container.height - size.height) / 2,
+                      width: size.width, height: size.height)
+    }
+
     /// Keep the pager and player at their original size while moving the rendered image.
     static func commentPlacement(viewport: CGRect, fitted: CGSize, target: CGRect?) -> (scale: CGFloat, offset: CGSize) {
         guard let target, fitted.width > 0, fitted.height > 0 else { return (1, .zero) }

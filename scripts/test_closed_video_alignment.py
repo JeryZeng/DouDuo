@@ -1,26 +1,45 @@
 #!/usr/bin/env python3
-"""Execute production geometry; open/half-open/narrow panes must remain centered."""
+"""Check production centered video geometry across outer, inner and split viewports."""
 from pathlib import Path
-import re, os, subprocess
-root=Path(__file__).resolve().parents[1]
-s=(root/'DouDuo/DouyinDuoLayout.swift').read_text()
-f=re.search(r'    static func closedPortraitVideoOffset\(.*?\n    }',s,re.S).group()
-code='import Foundation\nenum M {\n'+f+'\n}\n'+'''let pane = CGSize(width: 466, height: 678)
-precondition(M.closedPortraitVideoOffset(viewport: pane, videoAspect: 0.5625, fills: false, isDuo: true, isClosed: true) < 0)
-for p in [pane, CGSize(width:669,height:951), CGSize(width:430,height:800)] {
- precondition(M.closedPortraitVideoOffset(viewport:p, videoAspect:0.5625, fills:false, isDuo:true, isClosed:false) == 0)
+import subprocess
+import tempfile
+
+root = Path(__file__).resolve().parents[1]
+source = (root / "DouDuo/DYVideoFit.swift").read_text()
+checks = r'''
+let viewports = [CGSize(width: 466, height: 678), CGSize(width: 669, height: 951),
+                 CGSize(width: 430, height: 800), CGSize(width: 951, height: 669),
+                 CGSize(width: 390, height: 360)]
+for viewport in viewports {
+    for aspect in [0.25, 0.4, 9.0 / 16, 1.0, 16.0 / 9, 2.39] {
+        for fill in [false, true] {
+            let frame = DYVideoFit.contentFrame(container: viewport, videoAspect: aspect, fillWidth: fill)
+            precondition(abs(frame.midX - viewport.width / 2) < 0.001)
+            precondition(abs(frame.midY - viewport.height / 2) < 0.001)
+            precondition(frame.minX >= -0.001 && frame.minY >= -0.001)
+            precondition(frame.maxX <= viewport.width + 0.001 && frame.maxY <= viewport.height + 0.001)
+            let mode = DYVideoFit.presentation(fillWidth: fill, videoAspect: aspect,
+                                              screenAspect: viewport.width / viewport.height)
+            if mode == .aspectFit {
+                precondition(abs(frame.width / frame.height - aspect) < 0.001)
+            } else {
+                precondition(frame == CGRect(origin: .zero, size: viewport))
+            }
+        }
+    }
 }
-precondition(M.closedPortraitVideoOffset(viewport:pane, videoAspect:1.77, fills:false, isDuo:true, isClosed:true) == 0)
-precondition(M.closedPortraitVideoOffset(viewport:pane, videoAspect:0.5625, fills:true, isDuo:true, isClosed:true) == 0)
-print("PASS closed-only alignment; unfolded portrait, narrow split panes, landscape and fill unchanged")
+let narrow = DYVideoFit.contentFrame(container: viewports[0], videoAspect: 0.25, fillWidth: false)
+precondition(narrow.minX > 0)
+precondition(abs(narrow.minX - (viewports[0].width - narrow.maxX)) < 0.001)
+print("PASS tall videos retain equal side margins; fill/fit masks stay centered across viewports")
 '''
-p=Path(os.environ['TMPDIR'])/'closed-video-alignment.swift';p.write_text(code)
-subprocess.run(['swift',str(p)],check=True)
-assert '.onHingeChange' in s and 'context.hinge?.status == .closed' in s
-# 回归闸门：铰链状态只能在根视图读一次再经环境下发。每个视频页各自 onHingeChange 时，
-# 只有启动那一页收到回调，滑出来的新页永远居中（1.5.0 / 1.5.1 真机「合屏没靠左」）。
-mod = re.search(r'struct DYClosedPortraitAlignment.*?\n}\n', s, re.S).group()
-assert 'onHingeChange' not in mod and '@Environment(\\.dyHingeClosed)' in mod, 'DYClosedPortraitAlignment 不许自己监听铰链'
-app = (root/'DouDuo/DouDuoApp.swift').read_text()
-assert '.modifier(DYHingeStateRoot())' in app, 'App 根视图必须挂 DYHingeStateRoot'
-print("PASS hinge state read once at app root")
+with tempfile.TemporaryDirectory(prefix="douduo-video-alignment-") as temporary:
+    script = Path(temporary) / "main.swift"
+    script.write_text(source + "\n" + checks)
+    subprocess.run(["swift", str(script)], check=True)
+
+layout = (root / "DouDuo/DouyinDuoLayout.swift").read_text()
+app = (root / "DouDuo/DouDuoApp.swift").read_text()
+assert ".onHingeChange" in layout and "context.hinge?.status == .closed" in layout
+assert ".modifier(DYHingeStateRoot())" in app
+print("PASS shared hinge state remains at app root")
