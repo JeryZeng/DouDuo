@@ -452,6 +452,7 @@ struct PlayerPage: View {
     @State private var videoScale: CGFloat = 1
     @Environment(\.dyUsesClassicVideoLayout) private var usesClassicVideoLayout
     @Environment(\.dyCommentVideoFrame) private var commentVideoFrame
+    @Environment(\.dyVideoFitHorizontalBounds) private var videoFitHorizontalBounds
     @Environment(\.accessibilityReduceMotion) private var commentReduceMotion
 
     /// 评论打开且外屏要把横屏视频移到评论上方：四种界面都一样（评论统一用经典几何，老板 2026-11-17 定）
@@ -526,7 +527,8 @@ struct PlayerPage: View {
                                                               fillWidth: fillsVideoPlane)
                     let placement = showsVideoAboveComments
                         ? DYVideoFit.commentPlacement(viewport: geometry.frame(in: .global), fitted: contentFrame.size, target: commentVideoFrame)
-                        : (scale: CGFloat(1), offset: CGSize.zero)
+                        : DYVideoFit.chromePlacement(viewport: geometry.frame(in: .global), fitted: contentFrame.size,
+                                                     horizontalBounds: videoFitHorizontalBounds, fillWidth: fillWidth)
                     ZStack {
                         videoPlane
                             .mask {
@@ -553,7 +555,9 @@ struct PlayerPage: View {
                         ? DYVideoFit.commentPlacement(viewport: outer.frame(in: .global),
                                                       fitted: DYVideoFit.contentSize(container: outer.size, videoAspect: videoAspect, fillWidth: false),
                                                       target: commentVideoFrame)
-                        : (scale: CGFloat(1), offset: CGSize.zero)
+                        : DYVideoFit.chromePlacement(viewport: outer.frame(in: .global),
+                                                     fitted: DYVideoFit.contentSize(container: outer.size, videoAspect: videoAspect, fillWidth: false),
+                                                     horizontalBounds: videoFitHorizontalBounds, fillWidth: fillWidth)
                     videoPlane
                     .mask {
                     GeometryReader { geometry in
@@ -601,9 +605,15 @@ struct PlayerPage: View {
                 seekHUD
             }
             if !usesClassicVideoLayout && !cleanScreen && isActive && !isPlaying && (player != nil || vlc != nil) && !seeking {
-                Image(systemName: "play.fill").font(.system(size: 52 * ui)).foregroundStyle(.white.opacity(0.9))
-                    .themeShadow(.mediaLabel)
-                    .allowsHitTesting(false)
+                GeometryReader { geometry in
+                    let placement = DYVideoFit.chromePlacement(viewport: geometry.frame(in: .global),
+                        fitted: DYVideoFit.contentSize(container: geometry.size, videoAspect: videoAspect, fillWidth: false),
+                        horizontalBounds: videoFitHorizontalBounds, fillWidth: fillWidth)
+                    Image(systemName: "play.fill").font(.system(size: 52 * ui)).foregroundStyle(.white.opacity(0.9))
+                        .themeShadow(.mediaLabel)
+                        .position(x: geometry.size.width / 2 + placement.offset.width, y: geometry.size.height / 2)
+                }
+                .allowsHitTesting(false)
             }
         }
         .overlay(alignment: .topLeading) {

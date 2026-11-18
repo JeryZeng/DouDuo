@@ -119,6 +119,21 @@ struct DYComment: Identifiable, Decodable, Equatable {
     /// 稳定作者 UID 与精确被回复目标；缺字段时不得猜测送达。
     var uid: String? = nil
     var replyTo: String? = nil
+
+    func isWorkAuthor(_ author: DYAweme.Author) -> Bool {
+        func identifier(_ raw: String?) -> String? {
+            guard let value = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !value.isEmpty, value != "0" else { return nil }
+            return value
+        }
+        // Prefer sec_uid; compare uid only when one side lacks sec_uid.
+        // Nicknames and avatars cannot establish authorship.
+        if let commentSec = identifier(sec), let authorSec = identifier(author.secUid) {
+            return commentSec == authorSec
+        }
+        guard let commentUID = identifier(uid), let authorUID = identifier(author.uid) else { return false }
+        return commentUID == authorUID
+    }
 }
 
 /// 评论里的一张图：缩略图用于列表，原图用于点开全屏
@@ -3705,6 +3720,10 @@ struct DYUpstreamVideoPage: View {
                                     headEndSeconds: nil,
                                     continuationURL: nil,
                                     boost: boost)
+                    .modifier(DYVideoFitChromeArea(insets: insets,
+                        minimumRailInset: actionColumnWidth + chromeSidePadding
+                            + (hSize == .compact && !(chromeMode.usesRail && rootRailTab != nil && onBack == nil) ? 9 : 0),
+                        followsSystemEdge: chromeMode.usesRail, enabled: !commentsOpen))
             } else if usesOfflineFile {
                 ContentUnavailableView("这个离线视频已移除", systemImage: "airplane")
             } else {
@@ -4234,6 +4253,8 @@ struct DYClassicVideoPage: View {
                                     onHorizontalDragEnd: cleanScreen ? nil : onChannelDragEnd)
                     .environment(\.duoContentInsets, contentInsets)
                     .environment(\.dyUsesClassicVideoLayout, true)
+                    .modifier(DYVideoFitChromeArea(insets: insets, minimumRailInset: railWidth + chromeSidePadding,
+                                                 enabled: !inlineNavigation && !inlineCommentVisible))
             } else if usesOfflineFile {
                 ContentUnavailableView("这个离线视频已移除", systemImage: "airplane")
             } else {
@@ -5302,7 +5323,21 @@ struct DYCommentPanel: View {
                 placeholder: { Color.primary.opacity(0.08) }
                 .frame(width: 32, height: 32).clipShape(Circle())
             VStack(alignment: .leading, spacing: 4) {
-                Text(c.name).font(.caption.weight(.semibold)).foregroundStyle(.themeTextSecondary)
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(c.name).font(.caption.weight(.semibold)).foregroundStyle(.themeTextSecondary)
+                        .lineLimit(1)
+                    if c.isWorkAuthor(aweme.author) {
+                        Text("作者")
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(theme.accent.color(for: scheme))
+                            .padding(.horizontal, 4).padding(.vertical, 1)
+                            .background(theme.accent.color(for: scheme).opacity(0.12),
+                                        in: RoundedRectangle(cornerRadius: 3))
+                            .fixedSize()
+                            .accessibilityIdentifier("douyin.comment.authorBadge")
+                    }
+                }
+                .accessibilityElement(children: .combine)
                 if !c.text.isEmpty {
                     DYEmojiStore.shared.rich(c.text).font(.subheadline).foregroundStyle(.themeTextPrimary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -5370,7 +5405,8 @@ struct DYCommentPanel: View {
             if replyErr[c.id] != nil {
                 Button { replyErr[c.id] = nil; Task { await loadReplies(c) } } label: {
                     Text("回复加载失败，点此重试").font(.caption).foregroundStyle(.themeTextSecondary)
-                        .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
+                        .padding(.top, 12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -5383,10 +5419,10 @@ struct DYCommentPanel: View {
                         if replyLoading.contains(c.id) { ProgressView().controlSize(.mini) }
                     }
                     .font(.caption.weight(.medium)).foregroundStyle(.themeTextSecondary)
-                    // The whole row, including its whitespace, expands replies.
-                    // Keep this hit area inside the label so it cannot overlap
-                    // the neighboring comment's tap-to-reply gesture.
-                    .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
+                    // Reuse the original spacing as a tappable area; do not
+                    // make the row taller just to enlarge its hit target.
+                    .padding(.top, 12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)

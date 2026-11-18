@@ -88,13 +88,27 @@ enum DYVideoFit {
         return CGSize(width: container.height * aspect, height: container.height)
     }
 
-    /// Both playback renderers use the same centered mask, including very tall
-    /// videos on the outer display. Folding never changes media alignment.
+    /// Both playback renderers use the same centered local mask. Chrome and
+    /// comment placement transform that mask together with the rendered image.
     static func contentFrame(container: CGSize, videoAspect: Double, fillWidth: Bool) -> CGRect {
         let size = contentSize(container: container, videoAspect: videoAspect, fillWidth: fillWidth)
         return CGRect(x: (container.width - size.width) / 2,
                       y: (container.height - size.height) / 2,
                       width: size.width, height: size.height)
+    }
+
+    /// Fit the complete image between the window's actual chrome boundaries.
+    /// Intersect with the player first, so an already-inset player is not inset twice.
+    /// Transform the rendered plane and its mask together; moving only the mask crops video.
+    static func chromePlacement(viewport: CGRect, fitted: CGSize, horizontalBounds: ClosedRange<CGFloat>?,
+                                fillWidth: Bool) -> (scale: CGFloat, offset: CGSize) {
+        guard !fillWidth, let horizontalBounds,
+              fitted.width.isFinite, fitted.width > 1, viewport.width > 1 else { return (1, .zero) }
+        let left = max(viewport.minX, horizontalBounds.lowerBound)
+        let right = min(viewport.maxX, horizontalBounds.upperBound)
+        guard right - left > 1 else { return (1, .zero) }
+        return (min(1, (right - left) / fitted.width),
+                CGSize(width: (left + right) / 2 - viewport.midX, height: 0))
     }
 
     /// Keep the pager and player at their original size while moving the rendered image.

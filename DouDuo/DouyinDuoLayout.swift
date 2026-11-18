@@ -268,6 +268,45 @@ struct DYAdaptiveActionRail<Content: View>: View {
     }
 }
 
+extension EnvironmentValues {
+    @Entry var dyVideoFitHorizontalBounds: ClosedRange<CGFloat>? = nil
+}
+
+/// The outer display's complete-picture mode centers beside its control column.
+/// Share the rail's own geometry and system edge; do not assume a device column width.
+struct DYVideoFitChromeArea: ViewModifier {
+    let insets: EdgeInsets
+    let minimumRailInset: CGFloat
+    var followsSystemEdge = true
+    var enabled = true
+    @Environment(\.dyHingeClosed) private var hingeClosed
+    @Environment(\.dyCommentsOpen) private var commentsOpen
+    @Environment(\.dyInlineCommentVisible) private var inlineComments
+    @Environment(\.duoCleanScreen) private var cleanScreen
+    @Environment(\.layoutDirection) private var layoutDirection
+
+    private func horizontalBounds(edge: HorizontalEdge) -> ClosedRange<CGFloat>? {
+        guard enabled, hingeClosed, !commentsOpen, !inlineComments, !cleanScreen,
+              let window = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene })
+                .filter({ $0.activationState == .foregroundActive })
+                .flatMap(\.windows).first(where: \.isKeyWindow) else { return nil }
+        let leading = layoutDirection == .leftToRight ? insets.leading : insets.trailing
+        let trailing = layoutDirection == .leftToRight ? insets.trailing : insets.leading
+        let railOnLeft = (edge == .leading) == (layoutDirection == .leftToRight)
+        let left = max(leading, window.safeAreaInsets.left, railOnLeft ? minimumRailInset : 0)
+        let right = max(trailing, window.safeAreaInsets.right, railOnLeft ? 0 : minimumRailInset)
+        guard window.bounds.width - left - right > 1 else { return nil }
+        return (window.bounds.minX + left)...(window.bounds.maxX - right)
+    }
+
+    func body(content: Content) -> some View {
+        DYAdaptiveActionRail { edge in
+            content.environment(\.dyVideoFitHorizontalBounds,
+                                horizontalBounds(edge: followsSystemEdge ? edge : .trailing))
+        }
+    }
+}
+
 @available(iOS 27.1, *)
 private struct DYSystemActionRail<Content: View>: View {
     @Environment(\.toolbarVerticalEdge) private var systemEdge
@@ -399,13 +438,75 @@ enum DYBottomSheetKind {
     case comments, share, options
 }
 
+enum DYPanelDismissMotion {
+    static func progress(translation: CGFloat, travel: CGFloat) -> CGFloat {
+        guard travel > 0 else { return 0 }
+        return min(1, max(0, translation / travel))
+    }
+
+    static func closes(translation: CGFloat, velocity: CGFloat, travel: CGFloat) -> Bool {
+        // A deliberate reversal wins over distance: let the user pull the panel back.
+        guard translation > 0, velocity > -250 else { return false }
+        return progress(translation: translation, travel: travel) >= 0.45 ||
+            (translation >= 12 && velocity >= 700)
+    }
+}
+
 struct DYSheetDragActions {
+    let size: CGSize
     let update: (CGFloat) -> Void
     let finish: (Bool) -> Void
 }
 
 extension EnvironmentValues {
     @Entry var dySheetDrag: DYSheetDragActions? = nil
+}
+
+/// Both right swipes and downward pulls drive the presenter's actual exit path.
+/// Bottom panels move down; side panes move right. No animation runs under the finger.
+struct DYInteractivePanelDismiss: ViewModifier {
+    let size: CGSize
+    var exitAxis: Axis = .vertical
+    var enabled = true
+    let onClose: () -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var progress: CGFloat = 0
+    @State private var closing = false
+
+    private func update(_ value: CGFloat) {
+        guard !closing else { return }
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) { progress = value }
+    }
+
+    private func finish(_ shouldClose: Bool) {
+        guard !closing else { return }
+        guard shouldClose else {
+            withAnimation(reduceMotion ? nil : .snappy(duration: 0.22)) { progress = 0 }
+            return
+        }
+        closing = true
+        // Start hiding the keyboard with the remaining panel movement, not afterwards.
+        DYCommentPresentation.dismiss {}
+        withAnimation(reduceMotion ? nil : .smooth(duration: 0.18), completionCriteria: .logicallyComplete) {
+            progress = 1
+        } completion: {
+            if closing { onClose() }
+        }
+    }
+
+    func body(content: Content) -> some View {
+        content
+            .environment(\.dySheetDrag, enabled ? DYSheetDragActions(size: size, update: update, finish: finish) : nil)
+            .offset(x: exitAxis == .horizontal ? size.width * progress : 0,
+                    y: exitAxis == .vertical ? size.height * progress : 0)
+            .allowsHitTesting(!closing)
+            .onChange(of: enabled) { _, enabled in
+                if !enabled { progress = 0; closing = false }
+            }
+            .onDisappear { closing = false }
+    }
 }
 
 /// Shared dismissal arbitration. A vertical scroll that began below the top
@@ -417,31 +518,46 @@ struct DYPanelDismissGesture: ViewModifier {
     var onClose: (() -> Void)?
     @State private var direction: Axis?
     @State private var startedAtTop = false
+    @GestureState private var dragging = false
+
+    private func allows(_ axis: Axis) -> Bool {
+        axis == .horizontal ? allowsSwipeRight : startedAtTop
+    }
 
     func body(content: Content) -> some View {
         content.simultaneousGesture(DragGesture(minimumDistance: 10, coordinateSpace: .global)
+            .updating($dragging) { _, dragging, _ in dragging = true }
             .onChanged { value in
                 guard onClose != nil else { return }
                 if direction == nil {
                     startedAtTop = isAtTop
                     direction = abs(value.translation.width) > abs(value.translation.height) ? .horizontal : .vertical
                 }
-                if direction == .vertical, startedAtTop,
-                   value.translation.height > abs(value.translation.width) {
-                    sheetDrag?.update(value.translation.height)
-                }
+                guard let direction, allows(direction), let sheetDrag else { return }
+                let translation = direction == .horizontal ? value.translation.width : value.translation.height
+                let travel = direction == .horizontal ? sheetDrag.size.width : sheetDrag.size.height
+                // Always update, including reversals through zero, so the panel never sticks halfway.
+                sheetDrag.update(DYPanelDismissMotion.progress(translation: translation, travel: travel))
             }
             .onEnded { value in
                 defer { direction = nil }
-                guard let onClose else { return }
-                let dx = value.translation.width, dy = value.translation.height
-                let right = allowsSwipeRight && direction == .horizontal && dx > abs(dy) * 1.2 &&
-                    (dx > 70 || (dx > 25 && value.predictedEndTranslation.width > 160))
-                let down = direction == .vertical && startedAtTop && dy > abs(dx) * 1.2 &&
-                    (dy > 70 || (dy > 20 && value.predictedEndTranslation.height > 150))
-                if right || down { onClose() }
-                else { sheetDrag?.finish(false) }
+                guard let onClose, let direction, allows(direction) else { return }
+                let horizontal = direction == .horizontal
+                let translation = horizontal ? value.translation.width : value.translation.height
+                let velocity = horizontal ? value.velocity.width : value.velocity.height
+                let travel = horizontal ? sheetDrag?.size.width : sheetDrag?.size.height
+                let shouldClose = DYPanelDismissMotion.closes(translation: translation, velocity: velocity,
+                                                             travel: travel ?? 160)
+                if let sheetDrag { sheetDrag.finish(shouldClose) }
+                else if shouldClose { onClose() }
             })
+            .onChange(of: dragging) { _, dragging in
+                // Scroll-view takeover / system cancellation does not call onEnded.
+                if !dragging, direction != nil {
+                    direction = nil
+                    sheetDrag?.finish(false)
+                }
+            }
     }
 }
 
@@ -630,9 +746,7 @@ private struct DYEdgeBottomPanel<Panel: View>: View {
 }
 
 private struct DYEdgePanelSurface<Panel: View>: View {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    @State private var dragOffset: CGFloat = 0
     let width: CGFloat
     let height: CGFloat
     var isCommentSurface = false
@@ -647,12 +761,6 @@ private struct DYEdgePanelSurface<Panel: View>: View {
             topTrailingRadius: DDTheme.sheetCornerRadius)
         VStack(spacing: 0) {
             panel()
-                .environment(\.dySheetDrag, DYSheetDragActions(update: { offset in
-                    dragOffset = min(height, max(0, offset))
-                }, finish: { shouldClose in
-                    if shouldClose { onClose() }
-                    else { withAnimation(reduceMotion ? nil : .snappy(duration: 0.22)) { dragOffset = 0 } }
-                }))
         }
         .frame(width: width, height: height, alignment: .top)
         .background {
@@ -662,7 +770,7 @@ private struct DYEdgePanelSurface<Panel: View>: View {
         }
         .dyPanelGlass(in: shape)
         .clipShape(shape)
-        .offset(y: dragOffset)
+        .modifier(DYInteractivePanelDismiss(size: CGSize(width: width, height: height), onClose: onClose))
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("douyin.sheet.edgeSurface")
     }
@@ -851,6 +959,9 @@ struct DYCommentPlayerLayout<Video: View>: View {
                         .overlay(alignment: .leading) {
                             if layout.sideBySide { Color(uiColor: .separator).frame(width: 0.5) }
                         }
+                        .modifier(DYInteractivePanelDismiss(size: layout.paneSize, exitAxis: .horizontal,
+                                                           enabled: layout.sideBySide && !layout.resident,
+                                                           onClose: { showComments = false }))
                         .offset(x: layout.paneOrigin.x, y: layout.paneOrigin.y)
                         .accessibilityIdentifier("douyin.list.commentPane")
                 }

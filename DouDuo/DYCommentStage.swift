@@ -76,6 +76,9 @@ struct DYCommentStage<Feed: View, Author: View>: View {
                 .overlay(alignment: .leading) {
                     if layout.sideBySide { Color(uiColor: .separator).frame(width: 0.5) }
                 }
+                .modifier(DYInteractivePanelDismiss(size: layout.paneSize, exitAxis: .horizontal,
+                                                   enabled: layout.sideBySide && !layout.resident && !showsAuthorPane,
+                                                   onClose: { showComments = false }))
                 .padding(.leading, layout.paneOrigin.x)
                 .padding(.top, layout.paneOrigin.y)
             }
