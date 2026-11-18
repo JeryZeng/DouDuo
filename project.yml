@@ -12,7 +12,7 @@ settings:
     MARKETING_VERSION: 1.6.1
     CURRENT_PROJECT_VERSION: "117"
     SWIFT_VERSION: "5.0"
-    DEVELOPMENT_TEAM: ""
+    DEVELOPMENT_TEAM: "NV7X27LUKS"
 targets:
   DouDuo:
     type: application
@@ -23,7 +23,7 @@ targets:
       - package: VLCKitSPM
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: me.rrmm.douduo
+        PRODUCT_BUNDLE_IDENTIFIER: com.jiezeng.douduo
         PRODUCT_NAME: DouDuo
         INFOPLIST_KEY_CFBundleDisplayName: DouDuo
         TARGETED_DEVICE_FAMILY: "1,2"
