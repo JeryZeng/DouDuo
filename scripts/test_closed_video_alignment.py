@@ -32,6 +32,37 @@ let narrow = DYVideoFit.contentFrame(container: viewports[0], videoAspect: 0.25,
 precondition(narrow.minX > 0)
 precondition(abs(narrow.minX - (viewports[0].width - narrow.maxX)) < 0.001)
 print("PASS tall videos retain equal side margins; fill/fit masks stay centered across viewports")
+
+let outer = CGRect(x: 0, y: 0, width: 466, height: 678)
+for bounds: ClosedRange<CGFloat> in [0...382, 84...466, 20...382] {
+    for aspect in [0.25, 9.0 / 16, 1.0, 16.0 / 9] {
+        let fitted = DYVideoFit.contentSize(container: outer.size, videoAspect: aspect, fillWidth: false)
+        let placement = DYVideoFit.chromePlacement(viewport: outer, fitted: fitted,
+                                                  horizontalBounds: bounds, fillWidth: false)
+        let center = outer.midX + placement.offset.width
+        let width = fitted.width * placement.scale
+        precondition(abs(center - (bounds.lowerBound + bounds.upperBound) / 2) < 0.001)
+        precondition(center - width / 2 >= bounds.lowerBound - 0.001)
+        precondition(center + width / 2 <= bounds.upperBound + 0.001)
+        precondition(fitted.height * placement.scale <= outer.height + 0.001)
+        precondition(placement.scale > 0 && placement.scale <= 1)
+        let fill = DYVideoFit.chromePlacement(viewport: outer, fitted: fitted,
+                                             horizontalBounds: bounds, fillWidth: true)
+        precondition(fill.scale == 1 && fill.offset == .zero)
+        let noChrome = DYVideoFit.chromePlacement(viewport: outer, fitted: fitted,
+                                                 horizontalBounds: nil, fillWidth: false)
+        precondition(noChrome.scale == 1 && noChrome.offset == .zero)
+    }
+}
+let insetViewport = CGRect(x: 20, y: 80, width: 362, height: 598)
+let insetFit = DYVideoFit.contentSize(container: insetViewport.size, videoAspect: 9.0 / 16, fillWidth: false)
+let alreadyInset = DYVideoFit.chromePlacement(viewport: insetViewport, fitted: insetFit,
+                                             horizontalBounds: 20...382, fillWidth: false)
+precondition(alreadyInset.scale == 1 && alreadyInset.offset == .zero)
+let invalid = DYVideoFit.chromePlacement(viewport: outer, fitted: .zero,
+                                        horizontalBounds: 0...382, fillWidth: false)
+precondition(invalid.scale == 1 && invalid.offset == .zero)
+print("PASS complete image fits beside either rail; fill and already-inset players keep their geometry")
 '''
 with tempfile.TemporaryDirectory(prefix="douduo-video-alignment-") as temporary:
     script = Path(temporary) / "main.swift"

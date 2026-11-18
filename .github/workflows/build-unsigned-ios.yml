@@ -44,6 +44,7 @@ jobs:
         run: |
           python3 scripts/test_closed_video_alignment.py
           python3 scripts/test_comment_image_gestures.py
+          python3 scripts/test_comment_panel_drag.py
           python3 scripts/test_danmaku_layout.py
           python3 scripts/test_comment_preload.py
           python3 scripts/test_video_metadata.py
