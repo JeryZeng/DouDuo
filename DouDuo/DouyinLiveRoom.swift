@@ -478,7 +478,9 @@ final class DYLiveModel: ObservableObject {
             vlc.pause()
             vlc.outputMuted = true
             vlc.mediaPlayer.audio?.isMuted = true
-            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            DDAudioSessionGuard.allowDeactivate {
+                try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            }
         case .ended:
             let applicationActive = UIApplication.shared.applicationState == .active
             guard audioInterrupted, DDPlayback.shared.appIsActive || applicationActive else { return }
@@ -545,7 +547,7 @@ final class DYLiveModel: ObservableObject {
     @discardableResult
     private func activatePlaybackSession() -> Bool {
         do {
-            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback, options: DYLaunchMute.sessionOptions)
             try AVAudioSession.sharedInstance().setActive(true)
             return true
         } catch {
@@ -1048,6 +1050,8 @@ struct DYLiveFeed: View {
     @State private var sendError: String?
     @State private var showCategories = false
     @State private var showFollowLive = false
+    /// 直播间里点了主播：打开原生主播主页（工单 B32）
+    @State private var liveAuthor: DYAweme.Author?
     /// 「发现更多」只放分类。关注开播走旁边的「关注直播」。
     @State private var showDiscover = false
     /// 关注主播头像条：默认收起，只显示「N 位正在直播」胶囊；点胶囊展开，选了主播或离开直播页就收起。
@@ -1254,6 +1258,7 @@ struct DYLiveFeed: View {
         .onChange(of: moduleRequest) { _, request in
             guard let request, request.token != appliedModuleToken else { return }
             appliedModuleToken = request.token
+            DYLiveModel.log("DDLIVEMODULE apply \(request.action) token=\(request.token)")
             switch request.action {
             case .followedLive:
                 withAnimation(.easeInOut(duration: 0.2)) {
@@ -1302,6 +1307,16 @@ struct DYLiveFeed: View {
             }
             .presentationDetents([.medium, .large])
             .presentationDragIndicator(.visible)
+        }
+        .sheet(item: $liveAuthor, onDismiss: { DDPlayback.shared.releaseCover() }) { author in
+            NavigationStack {
+                DYAuthorScreen(bridge: bridge, author: author, onWeb: { url in
+                    liveAuthor = nil
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { onWeb(url) }
+                })
+            }
+            // 主页里可能点开作品播放：先把直播停住，关掉主页再接上
+            .onAppear { DDPlayback.shared.pauseAll(reason: .cover) }
         }
         .sheet(isPresented: $showFollowLive) {
             DYFollowLiveSheet(bridge: bridge) { room in
@@ -1456,21 +1471,21 @@ struct DYLiveFeed: View {
     }
 
     /// 顶部第一行：发现更多、关注直播选择器。位置由导航下沿和安全区决定。
+    /// 2026-11-20 老板嫌两颗文字胶囊碍眼 → 都收成小号图标：发现 = 圆形网格钮；关注在播 = 叠起来的红圈头像，不写字。
     private var discoverBar: some View {
-        HStack(spacing: hSize == .compact ? 8 : 10) {
+        HStack(spacing: 8) {
             Button {
                 withAnimation(.easeInOut(duration: 0.2)) { showDiscover.toggle() }
             } label: {
-                Label(showDiscover ? "收起" : "发现更多",
-                      systemImage: showDiscover ? "chevron.up" : "chevron.down")
-                    .font(.subheadline.weight(.medium))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
-                    .padding(.horizontal, 14)
-                    .frame(minHeight: DYLivePreviewChrome.minTapHeight)
-                    .ddMediaGlassCapsule()
+                Image(systemName: showDiscover ? "xmark" : "square.grid.2x2")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(width: 36, height: 36)
+                    .ddMediaGlassCircle()
+                    .frame(width: DYLivePreviewChrome.minTapHeight, height: DYLivePreviewChrome.minTapHeight)
+                    .contentShape(Rectangle())
             }
             .foregroundStyle(.primary).buttonStyle(.plain)
+            .accessibilityLabel(showDiscover ? "收起" : "发现更多")
             .accessibilityIdentifier("live.discover")
             if !model.followLive.isEmpty { followLiveButton }
             Spacer(minLength: 0)
@@ -1606,21 +1621,35 @@ struct DYLiveFeed: View {
     }
 
 
-    /// 替换原「我的关注」入口：有关注主播在播才出现，点开是一排头像，点头像直接进直播间。
+    /// 替换原「我的关注」入口：有关注主播在播才出现。不再写「N 位正在直播」，只叠 3 个红圈头像 + 「+N」角标，
+    /// 点开是一排头像，点头像直接进直播间。
     private var followLiveButton: some View {
         let count = model.followLive.count
+        let shown = Array(model.followLive.prefix(3))
         return Button { followStripExpanded.toggle() } label: {
-            Label("\(count) 位正在直播", systemImage: followStripExpanded ? "chevron.up" : "chevron.down")
-                .font(.subheadline.weight(.medium))
-                .lineLimit(1)
-                .minimumScaleFactor(0.8)
-                .padding(.horizontal, hSize == .compact ? 10 : 14)
-                .frame(minHeight: DYLivePreviewChrome.minTapHeight)
-                .ddMediaGlassCapsule()
+            HStack(spacing: 4) {
+                HStack(spacing: -10) {
+                    ForEach(shown) { r in
+                        CachedAsyncImage(url: r.avatar.flatMap(URL.init(string:))) { $0.resizable().scaledToFill() }
+                            placeholder: { theme.media.chromeFill.color(for: scheme) }
+                            .frame(width: 26, height: 26).clipShape(Circle())
+                            .overlay(Circle().stroke(theme.status.danger.color(for: scheme), lineWidth: 1.5))
+                    }
+                }
+                if count > shown.count {
+                    Text("+\(count - shown.count)").font(.caption2.weight(.semibold)).monospacedDigit()
+                }
+                Image(systemName: followStripExpanded ? "chevron.up" : "chevron.down").font(.caption2.weight(.semibold))
+            }
+            .padding(.leading, 5).padding(.trailing, 8)
+            .frame(height: 36)
+            .ddMediaGlassCapsule()
+            .frame(minHeight: DYLivePreviewChrome.minTapHeight)
+            .contentShape(Rectangle())
         }
         .foregroundStyle(.primary).buttonStyle(.plain)
         .accessibilityIdentifier("live.follow")
-        .accessibilityLabel("\(count) 位关注的主播正在直播")
+        .accessibilityLabel("\(count) 位正在直播（关注的主播）")
     }
 
     private func followStrip(scrollTail: CGFloat) -> some View {
@@ -1731,7 +1760,8 @@ struct DYLiveFeed: View {
                                    videoPane: video, interactionPane: interaction,
                                    ambientAxis: model.currentID == room.id ? ambientAxis : nil,
                                    splitRole: splitRole, splitAction: splitAction,
-                                   isolationID: "\(bridge.followSession):\(room.id)")
+                                   isolationID: "\(bridge.followSession):\(room.id)",
+                                   bridge: bridge, onAuthor: { liveAuthor = $0 })
                         .containerRelativeFrame([.horizontal, .vertical])
                         .contentShape(Rectangle())
                         .accessibilityHidden(model.currentID != room.id)
@@ -1881,7 +1911,19 @@ private struct DYLiveRoomPage: View {
     var splitRole: DYLiveLayoutToggleRole = .hidden
     var splitAction: () -> Void = {}
     var isolationID: String
+    /// 关注主播 / 读关注状态用（工单 B32）
+    @ObservedObject var bridge: DouyinBridge
+    /// 点主播头像/昵称：打开原生主播主页
+    var onAuthor: (DYAweme.Author) -> Void = { _ in }
+    @State private var followBusy = false
+    @State private var followMsg: String?
     private var foreground: Color { theme.media.onMedia.color(for: scheme) }
+    private var ownerFollowed: Bool {
+        guard let author = room.ownerAuthor else { return false }
+        return author.secUid.flatMap { bridge.authorFollowStates[$0] }
+            ?? author.uid.flatMap { bridge.authorFollowStates[$0] }
+            ?? ((author.follow ?? 0) > 0)
+    }
 
     var body: some View {
         GeometryReader { geo in
@@ -1989,27 +2031,39 @@ private struct DYLiveRoomPage: View {
                         safeBottom: geo.safeAreaInsets.bottom,
                         keyboardOverlap: isCurrent ? keyboardOverlap : 0))
                 } else {
-                    VStack(alignment: .leading, spacing: 12) {
+                    // 与推荐流里的直播卡同一套（老板 2026-11-20）：下方居中「点击进入直播间」，
+                    // 左下「直播中」小标签 + @主播 + 标题；不挡画面中间。
+                    VStack(spacing: 14) {
                         Spacer()
-                        HStack(spacing: 10) {
-                            avatar
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(room.owner).font(.headline).lineLimit(1)
-                                Text("直播中 · \(room.viewers) 在看").font(.caption)
-                            }
-                        }
-                        Text(room.title).font(.subheadline).lineLimit(2)
                         Button(action: model.enterRoom) {
-                            Text("进入直播间").font(.subheadline.weight(.semibold))
-                                .padding(.horizontal, 22).frame(height: 44).ddMediaGlassCapsule()
-                        }.buttonStyle(.plain).accessibilityIdentifier("live.room.enter")
-                        if model.rooms.count > 1 && !model.isFollowedVisit {
-                            Text("上滑切换直播间").font(.caption).foregroundStyle(theme.media.onMediaSecondary.color(for: scheme))
+                            HStack(spacing: 6) {
+                                Image(systemName: "chart.bar.fill")
+                                Text(room.viewers.isEmpty ? "点击进入直播间" : "点击进入直播间 · \(room.viewers)人在看")
+                            }
+                            .font(.subheadline)
+                            .padding(.horizontal, 16).padding(.vertical, 8)
+                            .background(Capsule().fill(.black.opacity(0.28)))
+                            .overlay(Capsule().stroke(foreground.opacity(0.25), lineWidth: 0.5))
                         }
+                        .buttonStyle(.plain)
+                        .frame(maxWidth: .infinity)
+                        .accessibilityIdentifier("live.room.enter")
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("直播中")
+                                .font(.caption.weight(.bold))
+                                .padding(.horizontal, 6).padding(.vertical, 2)
+                                .background(RoundedRectangle(cornerRadius: 3).fill(theme.status.danger.color(for: scheme)))
+                            Text("@" + room.owner).font(.headline.weight(.bold)).lineLimit(1)
+                            Text(room.title.isEmpty ? "\(room.owner) 正在直播" : room.title)
+                                .font(.subheadline).opacity(0.9)
+                                .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                        }
+                        .themeShadow(.mediaLabel)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.trailing, hSize == .compact ? 62 : 0)
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 20)
-                    .padding(.bottom, max(geo.safeAreaInsets.bottom, 12) + 24)
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, max(geo.safeAreaInsets.bottom, 12) + 28)
                 }
                 }
                 .frame(width: interaction.width, height: interaction.height)
@@ -2039,15 +2093,62 @@ private struct DYLiveRoomPage: View {
             if showsClose {
                 backCapsule(action: model.leaveRoom, id: "live.room.close")
             }
-            HStack(spacing: 8) {
-                avatar
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(room.owner).font(.subheadline.weight(.semibold)).lineLimit(1)
-                    Text("\(room.viewers) 在看").font(.caption2)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Button {
+                        if let author = room.ownerAuthor { onAuthor(author) }
+                    } label: {
+                        HStack(spacing: 8) {
+                            avatar
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(room.owner).font(.subheadline.weight(.semibold)).lineLimit(1)
+                                Text("\(room.viewers) 在看").font(.caption2)
+                            }
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(room.ownerAuthor == nil)
+                    .accessibilityLabel("主播 \(room.owner)，打开主页")
+                    .accessibilityIdentifier("live.room.owner")
+                    if room.ownerAuthor != nil, !ownerFollowed {
+                        Button { Task { await followOwner() } } label: {
+                            ZStack {
+                                Text("关注").opacity(followBusy ? 0 : 1)
+                                if followBusy { ProgressView().controlSize(.mini).tint(.white) }
+                            }
+                            .font(.caption.weight(.semibold)).foregroundStyle(.white)
+                            .padding(.horizontal, 12).frame(height: 28)
+                            .background(Capsule().fill(theme.status.danger.color(for: scheme)))
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(followBusy)
+                        .accessibilityLabel("关注 \(room.owner)")
+                        .accessibilityIdentifier("live.room.follow")
+                    }
                 }
-            }.padding(.trailing, 12).padding(.leading, 4).padding(.vertical, 4).foregroundStyle(.primary).ddMediaGlassCapsule()
+                .padding(.trailing, room.ownerAuthor != nil && !ownerFollowed ? 4 : 12).padding(.leading, 4).padding(.vertical, 4)
+                .foregroundStyle(.primary).ddMediaGlassCapsule()
+                if let followMsg {
+                    Text(followMsg).font(.caption2).foregroundStyle(theme.status.warning.color(for: scheme))
+                        .themeShadow(.mediaLabel)
+                }
+            }
             Spacer(minLength: 8)
         }
+    }
+
+    private func followOwner() async {
+        guard let author = room.ownerAuthor, !followBusy, !ownerFollowed else { return }
+        followBusy = true
+        defer { followBusy = false }
+        let failure: String?
+        do { failure = try await bridge.followVideoAuthor(author) } catch { failure = "关注失败：" + error.localizedDescription }
+        DYLiveModel.log("DDLIVE_FOLLOW room=\(room.id) ok=\(failure == nil)")
+        followMsg = failure
+        guard failure != nil else { return }
+        try? await Task.sleep(for: .seconds(3))
+        if followMsg == failure { followMsg = nil }
     }
     /// 和 douyin.web.back / douyin.mine.back / douyin.messages.back 同一套返回键语义：
     /// 「返回」标题 + chevron.backward 符号 + 胶囊底。直播间只保留这一颗，不再叠加系统侧栏返回。

@@ -21,6 +21,64 @@ final class DouDuoAppDelegate: NSObject, UIApplicationDelegate {
     #endif
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions options: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        // 不让 VLC（推荐直播卡）在前台关掉音频会话，否则下一条短视频开播后会被系统停住
+        DDAudioSessionGuard.install()
+        #if DEBUG
+        enum DYVideoCacheProbe {
+            static func anyLocal() -> URL? {
+                let d = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("dd-videos")
+                return (try? FileManager.default.contentsOfDirectory(at: d, includingPropertiesForKeys: nil))?.first { $0.pathExtension == "mp4" }
+            }
+        }
+        // 播放中直接丢掉 VLC 控制器（模拟离开推荐页时直播卡整页销毁），量主线程被占多久
+        if ProcessInfo.processInfo.environment["DOUDUO_VLCDEINIT_TEST"] == "1", let f = DYVideoCacheProbe.anyLocal() {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                var v: VLCPlayerController? = VLCPlayerController()
+                let surface = UIView(frame: CGRect(x: 0, y: 0, width: 160, height: 90))
+                UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.keyWindow }.first?.addSubview(surface)
+                v?.mediaPlayer.drawable = surface
+                v?.play(url: f)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                    let playing = v?.isPlaying ?? false
+                    let t0 = Date()
+                    v = nil                                   // 最后一个引用：触发 deinit
+                    let ms = Int(Date().timeIntervalSince(t0) * 1000)
+                    surface.removeFromSuperview()
+                    DYLiveModel.log("DDVLCDEINIT playing=\(playing) mainBlockedMs=\(ms)")
+                }
+            }
+        }
+        if ProcessInfo.processInfo.environment["DOUDUO_AUDIOGUARD_TEST"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                let s = AVAudioSession.sharedInstance()
+                try? s.setCategory(.playback, options: DYLaunchMute.sessionOptions); try? s.setActive(true)
+                let before = DDAudioSessionGuard.blocked
+                try? s.setActive(false, options: .notifyOthersOnDeactivation)   // 模拟 VLC：前台关会话 → 应被拦
+                let blockedVLC = DDAudioSessionGuard.blocked - before
+                var ok = false
+                DDAudioSessionGuard.allowDeactivate { ok = (try? s.setActive(false)) != nil }   // 我们自己关 → 应放行
+                DYLiveModel.log("DDAUDIOGUARD selftest blockedForeign=\(blockedVLC) ownAllowed=\(ok) blockedTotal=\(DDAudioSessionGuard.blocked)")
+                // 真 VLC：播本地视频 3 秒再 stop，看它是否去关会话、有没有被拦
+                if let f = Bundle.main.url(forResource: "vlcprobe", withExtension: "mp4") ?? DYVideoCacheProbe.anyLocal() {
+                    let v = VLCPlayerController()
+                    try? s.setActive(true)
+                    let b0 = DDAudioSessionGuard.blocked
+                    // 没有界面层也得给 VLC 一个渲染目标，否则它不真正开播
+                    let surface = UIView(frame: CGRect(x: 0, y: 0, width: 160, height: 90))
+                    UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.keyWindow }.first?.addSubview(surface)
+                    v.mediaPlayer.drawable = surface
+                    v.play(url: f)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                        v.stop()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                            DYLiveModel.log("DDAUDIOGUARD vlc-test file=\(f.lastPathComponent) blockedByVLC=\(DDAudioSessionGuard.blocked - b0) played=\(v.duration)")
+                            _ = v; surface.removeFromSuperview()
+                        }
+                    }
+                } else { DYLiveModel.log("DDAUDIOGUARD vlc-test no local file") }
+            }
+        }
+        #endif
         #if DEBUG
         if ProcessInfo.processInfo.environment["DOUDUO_RESET_HASHTAG_FILTER"] == "1" {
             UserDefaults.standard.removeObject(forKey: DYHashtagFilter.storageKey)
@@ -101,9 +159,17 @@ struct DouDuoApp: App {
                                    diskPath: "dd-url-cache")
         // 自动清理以前版本漏在 tmp 里的视频下载残留（分段目录 / 半截下载），老用户升级后不用手动点清理
         DYStorageFiles.cleanLeftoversAtLaunch()
+        // 「不再推荐看过的视频」：推荐接口新推来的，划到过就跳过（开关在设置 → 推荐与内容）
+        DYFeedModel.isSeen = { id in DYSeenHistory.enabled && DYSeenHistory.shared.contains(id) }
+        DYLaunchMute.apply()
         // 后台网页不许登出 + 登录被清掉时提示（老板 11-18：评论发不出就是被退出了，App 还没提示）
         Task { @MainActor in
             DYLogoutBlock.prepare()
+            DYKeyStateProbe.log = { DYLiveModel.log($0) }
+            DYPassportVerify.log = { DYLiveModel.log($0) }
+            #if DEBUG
+            DYPassportVerify.runDemoIfRequested()
+            #endif
             DYSessionWatch.shared.start()
         }
     }
@@ -140,6 +206,7 @@ struct DouDuoApp: App {
             .overlay(alignment: .topLeading) { DDAppearanceStateProbe() }
             #endif
             .modifier(DYHingeStateRoot())
+            .modifier(DYCollectPromptHost(owner: .feed))
             .task(id: scenePhase) {
                 if scenePhase == .active { await DYOfflineDownloads.shared.refreshRetention() }
             }

@@ -27,6 +27,8 @@ struct DYClassicNativeForwardPanel: View {
     let onClose: () -> Void
     var selectedID: String? = nil
     var composer: AnyView? = nil
+    /// 朋友横排滑到最后的「更多」：打开搜索全部朋友（官方同款）
+    var onMore: (() -> Void)? = nil
 
     @ScaledMetric(relativeTo: .subheadline) private var itemWidth: CGFloat = 84
     private let avatarSize: CGFloat = 54
@@ -91,7 +93,8 @@ struct DYClassicNativeForwardPanel: View {
     private var contactRow: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(alignment: .top, spacing: WuWeiDesign.Spacing.sm) {
-                ForEach(contacts) { contact in
+                // 只排最近联系的 10 个，其余从末尾「更多」里搜（老板 11-23）
+                ForEach(Array(contacts.prefix(10))) { contact in
                     Button { onContact(contact) } label: {
                         VStack(spacing: WuWeiDesign.Spacing.sm) {
                             CachedAsyncImage(url: contact.avatar.flatMap(URL.init(string:))) { image in
@@ -134,6 +137,28 @@ struct DYClassicNativeForwardPanel: View {
                     .accessibilityAddTraits(selectedID == contact.id ? .isSelected : [])
                     .accessibilityHint(contact.kind == 2 ? "选择群聊，确认后发送" : "选择联系人，确认后发送")
                     .accessibilityIdentifier("douyin.forward.contact.\(contact.id)")
+                }
+                if let onMore {
+                    Button(action: onMore) {
+                        VStack(spacing: WuWeiDesign.Spacing.sm) {
+                            Circle()
+                                .fill(Color(uiColor: .tertiarySystemFill))
+                                .overlay {
+                                    Image(systemName: "ellipsis")
+                                        .font(.title2.weight(.semibold))
+                                        .foregroundStyle(.themeTextSecondary)
+                                }
+                                .frame(width: avatarSize, height: avatarSize)
+                            Text("更多")
+                                .font(.subheadline)
+                                .frame(maxWidth: .infinity)
+                        }
+                        .frame(width: itemWidth)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("更多朋友，搜索")
+                    .accessibilityIdentifier("douyin.forward.more")
                 }
             }
             .padding(.horizontal, inset)
@@ -214,6 +239,8 @@ struct DYUpstreamNativeForwardPanel: View {
     let onClose: () -> Void
     var selectedID: String? = nil
     var composer: AnyView? = nil
+    /// 朋友横排滑到最后的「更多」：打开搜索全部朋友（官方同款）
+    var onMore: (() -> Void)? = nil
 
     @ScaledMetric(relativeTo: .subheadline) private var itemWidth: CGFloat = 84
     private let avatarSize: CGFloat = 60
@@ -283,7 +310,8 @@ struct DYUpstreamNativeForwardPanel: View {
     private var contactRow: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(alignment: .top, spacing: WuWeiDesign.Spacing.sm) {
-                ForEach(contacts) { contact in
+                // 只排最近联系的 10 个，其余从末尾「更多」里搜（老板 11-23）
+                ForEach(Array(contacts.prefix(10))) { contact in
                     Button { onContact(contact) } label: {
                         VStack(spacing: WuWeiDesign.Spacing.sm) {
                             CachedAsyncImage(url: contact.avatar.flatMap(URL.init(string:))) { image in
@@ -326,6 +354,28 @@ struct DYUpstreamNativeForwardPanel: View {
                     .accessibilityAddTraits(selectedID == contact.id ? .isSelected : [])
                     .accessibilityHint(contact.kind == 2 ? "选择群聊，确认后发送" : "选择联系人，确认后发送")
                     .accessibilityIdentifier("douyin.forward.contact.\(contact.id)")
+                }
+                if let onMore {
+                    Button(action: onMore) {
+                        VStack(spacing: WuWeiDesign.Spacing.sm) {
+                            Circle()
+                                .fill(Color(uiColor: .tertiarySystemFill))
+                                .overlay {
+                                    Image(systemName: "ellipsis")
+                                        .font(.title2.weight(.semibold))
+                                        .foregroundStyle(.themeTextSecondary)
+                                }
+                                .frame(width: avatarSize, height: avatarSize)
+                            Text("更多")
+                                .font(.subheadline)
+                                .frame(maxWidth: .infinity)
+                        }
+                        .frame(width: itemWidth)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("更多朋友，搜索")
+                    .accessibilityIdentifier("douyin.forward.more")
                 }
             }
             .padding(.horizontal, inset)
@@ -393,14 +443,16 @@ struct DYNativeForwardPanel: View {
     let onClose: () -> Void
     var selectedID: String? = nil
     var composer: AnyView? = nil
+    /// 朋友横排滑到最后的「更多」：打开搜索全部朋友（官方同款）
+    var onMore: (() -> Void)? = nil
     @AppStorage(DDChromeMode.key) private var mode = DDChromeMode.classic.rawValue
     var body: some View {
         if #available(iOS 27.1, *), mode == DDChromeMode.duoClassic.rawValue {
             DYClassicNativeForwardPanel(contacts: contacts, loading: loading, status: status, actions: actions,
-                                       onContact: onContact, onAction: onAction, onClose: onClose, selectedID: selectedID, composer: composer)
+                                       onContact: onContact, onAction: onAction, onClose: onClose, selectedID: selectedID, composer: composer, onMore: onMore)
         } else {
             DYUpstreamNativeForwardPanel(contacts: contacts, loading: loading, status: status, actions: actions,
-                                        onContact: onContact, onAction: onAction, onClose: onClose, selectedID: selectedID, composer: composer)
+                                        onContact: onContact, onAction: onAction, onClose: onClose, selectedID: selectedID, composer: composer, onMore: onMore)
         }
     }
 }

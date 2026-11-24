@@ -19,13 +19,23 @@ struct DYNotice: Identifiable, Codable, Equatable {
     /// 评论通知：这条评论的 cid；是楼中楼时 parentCid = 一级评论 cid（回复/定位都要用）
     var cid: String? = nil
     var parentCid: String? = nil
+    /// 一级评论 cid；旧缓存里一级评论的 parentCid 存成了作品 id（见 noticeJS），这里一律当成没有
+    var threadParent: String? {
+        guard let p = parentCid, !p.isEmpty, p != awemeID, p != cid else { return nil }
+        return p
+    }
     /// 被回复的那条（通常是我的评论）原文，列表里灰字引用
     var quote: String? = nil
+    /// 赞通知合并的人数（「等 N 人」）；>1 时可点开看全部点赞的人
+    var diggCount: Int? = nil
+    var isFollowRequest: Bool { type == 98 }
 
     var isComment: Bool { type == 31 && (cid?.isEmpty == false) && (awemeID?.isEmpty == false) }
+    /// @我的（type 45）：评论里 @ 时带 cid，点开定位到那条评论；不给回复入口（拿不到一级评论 id，回错楼会挂空）
+    var isMention: Bool { type == 45 }
     var commentFocus: DYCommentFocus? {
-        guard isComment, let cid, let awemeID else { return nil }
-        return DYCommentFocus(awemeID: awemeID, cid: cid, parentCid: parentCid)
+        guard isComment || (isMention && cid?.isEmpty == false && awemeID?.isEmpty == false), let cid, let awemeID else { return nil }
+        return DYCommentFocus(awemeID: awemeID, cid: cid, parentCid: threadParent)
     }
 }
 
@@ -34,6 +44,8 @@ struct DYCommentFocus: Equatable, Hashable {
     let awemeID: String
     let cid: String
     let parentCid: String?
+    /// 通知里点「回复」：定位到这条后直接进入「回复 @它」（和在评论区里点它一样，走同一套发送）
+    var startReply = false
 }
 
 struct DYNoticePage: Decodable {
@@ -50,10 +62,17 @@ struct DYNoticeCount: Decodable {
     let count: Int
 }
 
+/// notice/count 的 interactive_group：网页筛选项 type（"25" 全部含推荐 / "26" 推荐…）→ 接口分组号
+struct DYNoticeInteractiveGroup: Decodable {
+    let type: String
+    let group: Int
+}
+
 private struct DYNoticeCountPage: Decodable {
     let status: Int
     let code: Int?
     let groups: [DYNoticeCount]
+    var inter: [DYNoticeInteractiveGroup]? = nil
     let msg: String?
 }
 
@@ -88,6 +107,13 @@ private struct DYDetailPage: Decodable {
     let code: Int?
     let item: DYAweme?
     let msg: String?
+    let shape: DYDetailShape?
+}
+
+/// 作品原始形态（诊断用）：网页接口怎么给图文 / 文字帖
+private struct DYDetailShape: Decodable {
+    let t: Int?; let m: Int?; let dur: Double?; let wh: String?; let play: Int?; let gears: Int?
+    let img: Int?; let img0: String?; let music: Bool?; let keys: String?
 }
 
 extension DouyinBridge {
@@ -96,6 +122,10 @@ extension DouyinBridge {
         let p = try JSONDecoder().decode(DYNoticeCountPage.self, from: d)
         if p.code == 8 { throw DYError.bad("抖音未登录") }
         guard p.status == 200 else { throw DYError.blocked(p.msg ?? "HTTP \(p.status)") }
+        if let inter = p.inter, !inter.isEmpty {
+            DYNoticeGroupMap.update(inter)
+            DYLiveModel.log("DDNOTICE groups " + inter.map { "\($0.type)=\($0.group)" }.joined(separator: ","))
+        }
         return p.groups
     }
 
@@ -112,6 +142,9 @@ extension DouyinBridge {
     func awemeDetail(_ id: String) async throws -> DYAweme {
         let d = try await call(Self.detailJS, args: ["id": id], attempts: 1)
         let p = try JSONDecoder().decode(DYDetailPage.self, from: d)
+        if let sh = p.shape {
+            DYLiveModel.log("DDDETAILSHAPE id=\(id) type=\(sh.t.map(String.init) ?? "-") media=\(sh.m.map(String.init) ?? "-") dur=\(Int(sh.dur ?? 0))ms wh=\(sh.wh ?? "-") play=\(sh.play ?? 0) gears=\(sh.gears ?? 0) img=\(sh.img ?? 0) img0=\(sh.img0 ?? "-") music=\(sh.music == true) keys=\(sh.keys ?? "")")
+        }
         if p.code == 8 { throw DYError.bad("抖音未登录") }
         guard p.status == 200, let item = p.item, item.play != nil || !item.images.isEmpty else {
             throw DYError.bad(p.msg?.isEmpty == false ? p.msg! : "打不开这条视频")
@@ -184,13 +217,17 @@ extension DouyinBridge {
     const d = parse(r.t) || {};
     const raw = d.notice_count || d.notice_count_list || [];
     const groups = raw.map(x => ({ group: Number(x.group ?? x.notice_group ?? 0), count: Number(x.count || 0) }));
-    return JSON.stringify({ status: r.s, code: d.status_code ?? null, groups, msg: d.status_msg || null });
+    // 网页版用它把「推荐」等筛选项映射到分组号（type 是字符串 "25"/"26"…）
+    const inter = (d.interactive_group || []).map(x => ({ type: String(x.type ?? ''), group: Number(x.group || 0) })).filter(x => x.type && x.group);
+    return JSON.stringify({ status: r.s, code: d.status_code ?? null, groups, inter, msg: d.status_msg || null });
     """#
 
     private static let noticeListJS = #"""
     const authorOf = u => {
       if (!u || (!u.nickname && !u.sec_uid)) return null;
-      return { name: u.nickname || '', avatar: first(u.avatar_thumb) || first(u.avatar_larger), secUid: u.sec_uid || null, uid: u.uid ? String(u.uid) : null };
+      // follow = 我→对方 follow_status；follower = 对方→我 follower_status（头像红心 / 「粉丝」标签用）
+      return { name: u.nickname || '', avatar: first(u.avatar_thumb) || first(u.avatar_larger), secUid: u.sec_uid || null, uid: u.uid ? String(u.uid) : null,
+               follow: typeof u.follow_status === 'number' ? u.follow_status : null, follower: typeof u.follower_status === 'number' ? u.follower_status : null };
     };
     const coverOf = a => {
       if (!a) return null;
@@ -203,7 +240,7 @@ extension DouyinBridge {
       const gn = n.general_notice || {};
       const inn = n.interactive_notice || {};
       let name = '', avatar = null, action = gn.title || '通知', detail = gn.content || '', cover = null, awemeID = n.aweme_id ? String(n.aweme_id) : null, author = null, images = null;
-      let cid = null, parentCid = null, quote = null;
+      let cid = null, parentCid = null, quote = null, diggCount = 0;
       if (t === 31 && n.comment) {
         const c = n.comment.comment || {};
         const u = c.user || {};
@@ -213,7 +250,11 @@ extension DouyinBridge {
         // 楼中楼：reply_id = 一级评论 cid（网页 comment/list/reply 实测）；一级评论为 '0'
         // 通知里的 comment 没有 reply_id，楼中楼的一级评论在 n.comment.parent_id（一级评论时为 0 或等于自身）
         const pick = v => (v !== undefined && v !== null && String(v) !== '0' && String(v) !== '') ? String(v) : null;
-        const rid = pick(n.comment.parent_id) || pick(c.reply_id) || pick(n.comment.level1_comment && n.comment.level1_comment.cid);
+        // ⚠️ 一级评论的通知里 parent_id 是「作品 id」不是评论 id（11-19 真机：parent=aweme_id），
+        // 当成楼中楼去回复 → reply_id=作品 id，抖音回 code=0 但这条挂到不存在的楼下，谁都看不到
+        const awemeOf = (c.aweme_id && String(c.aweme_id)) || (n.comment.aweme && n.comment.aweme.aweme_id && String(n.comment.aweme.aweme_id)) || (n.aweme_id ? String(n.aweme_id) : '');
+        const notAweme = v => { const x = pick(v); return x && x !== awemeOf ? x : null; };
+        const rid = pick(c.reply_id) || pick(n.comment.level1_comment && n.comment.level1_comment.cid) || notAweme(n.comment.parent_id);
         parentCid = rid && rid !== cid ? rid : null;
         quote = (n.comment.reply_comment && n.comment.reply_comment.text) || null;
         action = parentCid ? '回复了你的评论' : '评论了你';
@@ -226,7 +267,8 @@ extension DouyinBridge {
       } else if (t === 41 && n.digg) {
         const users = n.digg.from_user || [];
         const u = users[0] || {};
-        const extra = (n.digg.merge_count || users.length) > 1 ? ' 等' + (n.digg.merge_count || users.length) + '人' : '';
+        diggCount = Number(n.digg.merge_count || users.length || 0);
+        const extra = diggCount > 1 ? ' 等' + diggCount + '人' : '';
         name = (u.nickname || '') + extra;
         avatar = first(u.avatar_thumb);
         action = '赞了你的作品';
@@ -234,18 +276,32 @@ extension DouyinBridge {
         cover = coverOf(n.digg.aweme);
         awemeID = (n.digg.aweme && n.digg.aweme.aweme_id && String(n.digg.aweme.aweme_id)) || awemeID;
         author = authorOf(u);
-      } else if (t === 33 && n.follow) {
+      } else if ((t === 33 || t === 98) && n.follow) {
+        // 98 = 关注请求（私密账号）：网页版可「通过 / 拒绝」
         const u = n.follow.from_user || {};
         name = u.nickname || '';
         avatar = first(u.avatar_thumb);
-        action = '关注了你';
+        action = t === 98 ? '请求关注你' : '关注了你';
         detail = n.follow.content || '';
         author = authorOf(u);
-      } else if (t === 9009) {
+      } else if (t === 45 && n.at) {
+        // @我的：网页版 at{user_info, sub_type 0/1 发作品时 @ / 2 评论里 @, content, aweme, schema_url 带 cid, comment_status 0=已删}
+        const at = n.at;
+        const u = at.user_info || {};
+        name = u.remark_name || u.nickname || '';
+        avatar = first(u.avatar_thumb);
+        action = Number(at.sub_type || 0) === 2 ? '在评论中提到了你' : '在发布作品时提到了你';
+        detail = (at.comment_status === 0) ? (Number(at.sub_type || 0) === 2 ? '此评论已删除' : '此作品已删除') : (at.content || gn.content || '');
+        cover = coverOf(at.aweme);
+        awemeID = (n.aweme_id ? String(n.aweme_id) : null) || (at.aweme && at.aweme.aweme_id ? String(at.aweme.aweme_id) : null);
+        const m = String(at.schema_url || '').match(/cid=(\d+)/);
+        cid = (Number(at.sub_type || 0) === 2 && m) ? m[1] : null;
+        author = authorOf(u);
+      } else if (t === 9009 || t === 9002 || t === 514 || t === 9067) {
         const u = (inn.from_user && inn.from_user[0]) || {};
         name = u.nickname || inn.author || '';
         avatar = first(u.avatar_thumb) || urlOf(inn.avatar_url);
-        action = '推荐了你的视频';
+        action = t === 9009 ? '推荐了你的视频' : (inn.title || gn.title || '推荐了作品');
         detail = inn.content || inn.desc || gn.content || '';
         cover = urlOf(inn.image_url) || coverOf(inn.aweme);
         awemeID = (inn.aweme && inn.aweme.aweme_id && String(inn.aweme.aweme_id)) || awemeID;
@@ -259,7 +315,7 @@ extension DouyinBridge {
       return {
         id: String(n.nid_str || n.nid || (t + '-' + (n.create_time || 0))),
         type: t, time: n.create_time || 0, name, avatar, action, detail, cover, images: (images && images.length) ? images : null, awemeID, author,
-        hasRead: !!(n.has_read || n.read_time), cid, parentCid, quote
+        hasRead: !!(n.has_read || n.read_time), cid, parentCid, quote, diggCount: diggCount || null
       };
     };
     const r = await req('GET', '/aweme/v1/web/notice/?' + q({
@@ -279,11 +335,21 @@ extension DouyinBridge {
     const r = await req('GET', '/aweme/v1/web/aweme/detail/?' + q({ aweme_id: id }));
     const d = parse(r.t) || {};
     const a = d.aweme_detail || d.aweme || null;
-    return JSON.stringify({ status: r.s, code: d.status_code ?? null, item: (a && (a.video || a.images)) ? mapA(a) : null, msg: d.status_msg || null });
+    // 诊断（2026-11-21 图文/文字帖）：记下作品类型和图文相关字段，看网页接口怎么给「文字」帖
+    let shape = null;
+    if (a) {
+      const v = a.video || {};
+      shape = { t: a.aweme_type, m: a.media_type, dur: v.duration || 0, wh: (v.width || 0) + 'x' + (v.height || 0),
+        play: ((v.play_addr && v.play_addr.url_list) || []).length, gears: (v.bit_rate || []).length,
+        img: (a.images || []).length, img0: a.images && a.images[0] ? Object.keys(a.images[0]).join('|') : null,
+        music: !!(a.music && a.music.play_url && (a.music.play_url.url_list || []).length),
+        keys: Object.keys(a).filter(k => /text|note|slide|graphic|image|clip|media/i.test(k)).join('|') };
+    }
+    return JSON.stringify({ status: r.s, code: d.status_code ?? null, item: (a && (a.video || a.images)) ? mapA(a) : null, msg: d.status_msg || null, shape });
     """#
 
     private static let authorPostJS = #"""
-    const r = await req('GET', '/aweme/v1/web/aweme/post/?' + q({
+    const r = await req('GET', '/aweme/v1/web/aweme/post/?' + qPost({
       sec_user_id: sec, max_cursor: cursor, locate_query: 'false', show_live_replay_strategy: '1',
       need_time_list: '1', time_list_query: '0', whale_cut_token: '', cut_version: '1', count: '18'
     }));

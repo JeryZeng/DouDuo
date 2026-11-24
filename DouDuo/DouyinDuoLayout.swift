@@ -46,10 +46,10 @@ enum DYDuoMetrics {
 
     /// Full-bleed media and sheets deliberately extend past SwiftUI's safe
     /// area. Their controls still clear the physical home-indicator region.
-    static var windowBottomInset: CGFloat {
-        UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-            .flatMap(\.windows).first(where: \.isKeyWindow)?.safeAreaInsets.bottom ?? 0
-    }
+    /// 同 windowSafeTop：读缓存，别在 body 里同步问窗口。
+    static var windowBottomInset: CGFloat { MainActor.assumeIsolated { DYWindowInsets.shared.read().bottom } }
+    static var windowLeftInset: CGFloat { MainActor.assumeIsolated { DYWindowInsets.shared.read().left } }
+    static var windowRightInset: CGFloat { MainActor.assumeIsolated { DYWindowInsets.shared.read().right } }
 
     static func bottomSafeAreaExtension(in geo: GeometryProxy) -> CGFloat {
         let inset = geo.safeAreaInsets.bottom
@@ -90,10 +90,10 @@ enum DYDuoMetrics {
     }()
 
     /// 窗口顶部安全区（状态栏 / 灵动岛高度）。播放页整层忽略了安全区，GeometryProxy 量到的 top 为 0，只能读窗口。
-    @MainActor static var windowSafeTop: CGFloat {
-        UIApplication.shared.connectedScenes
-            .compactMap { ($0 as? UIWindowScene)?.keyWindow }.first?.safeAreaInsets.top ?? 0
-    }
+    /// ⚠️ 返回缓存值，**不能在 body 里同步读 keyWindow.safeAreaInsets**：那会让 UIKit 在 SwiftUI 刷新途中重新布局，
+    /// 触发 AttributeGraph「Cycle detected」，之后推荐页再也不刷新（1.6.2/1.6.3 普通 iPhone 默认界面：开头不播、
+    /// 滑几条就滑不动、点关注/直播没反应；Duo 走另一个分支不读它所以没事）。新值异步写回，用到的视图自动重画。
+    @MainActor static var windowSafeTop: CGFloat { DYWindowInsets.shared.read().top }
 
     /// A system split or floating window can still receive the display's
     /// active hinge region. Only use it to lay out an app occupying the display.
@@ -293,8 +293,8 @@ struct DYVideoFitChromeArea: ViewModifier {
         let leading = layoutDirection == .leftToRight ? insets.leading : insets.trailing
         let trailing = layoutDirection == .leftToRight ? insets.trailing : insets.leading
         let railOnLeft = (edge == .leading) == (layoutDirection == .leftToRight)
-        let left = max(leading, window.safeAreaInsets.left, railOnLeft ? minimumRailInset : 0)
-        let right = max(trailing, window.safeAreaInsets.right, railOnLeft ? 0 : minimumRailInset)
+        let left = max(leading, DYDuoMetrics.windowLeftInset, railOnLeft ? minimumRailInset : 0)
+        let right = max(trailing, DYDuoMetrics.windowRightInset, railOnLeft ? 0 : minimumRailInset)
         guard window.bounds.width - left - right > 1 else { return nil }
         return (window.bounds.minX + left)...(window.bounds.maxX - right)
     }
@@ -550,7 +550,7 @@ struct DYPanelDismissGesture: ViewModifier {
                                                              travel: travel ?? 160)
                 if let sheetDrag { sheetDrag.finish(shouldClose) }
                 else if shouldClose { onClose() }
-            })
+            }, including: onClose == nil ? .none : .all)
             .onChange(of: dragging) { _, dragging in
                 // Scroll-view takeover / system cancellation does not call onEnded.
                 if !dragging, direction != nil {
@@ -944,6 +944,7 @@ struct DYCommentPlayerLayout<Video: View>: View {
                     .environment(\.duoCleanScreen, cleanScreen)
                     .environment(\.dyCommentsOpen, showsComments || layout.showsPane)
                     .frame(width: layout.videoSize.width, height: layout.videoSize.height)
+                    .environment(\.dyRestrictsPlaybackToPane, layout.showsPane && layout.sideBySide)
                     // 侧栏评论时裁边：播放器环境光底铺满整屏，会盖住右侧评论栏（同推荐页 DYCommentStage）
                     .modifier(DDClipIf(on: layout.showsPane && layout.sideBySide))
                 if layout.showsPane, let aweme = commentItem {
@@ -955,7 +956,7 @@ struct DYCommentPlayerLayout<Video: View>: View {
                         .id(aweme.id)
                         .frame(width: layout.paneSize.width, height: layout.paneSize.height)
                         .clipped()
-                        .dyDeskLight(layout.resident && !layout.sideBySide)
+                        .dyDeskLight(layout.resident && !layout.sideBySide, videoHeight: layout.videoSize.height)
                         .overlay(alignment: .leading) {
                             if layout.sideBySide { Color(uiColor: .separator).frame(width: 0.5) }
                         }
@@ -974,6 +975,8 @@ struct DYCommentPlayerLayout<Video: View>: View {
                                          isClean: cleanScreen, onToggleClean: { cleanScreen.toggle() },
                                          onBack: onBack, backIdentifier: backIdentifier)
                         .id(horizontalCommentStatus || hidesCommentStatus)
+                        .frame(width: layout.videoSize.width)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
             .modifier(DYStandaloneBarPolicy(classic: usesClassicLayout))
@@ -1072,6 +1075,39 @@ struct DYHingeStateRoot: ViewModifier {
                 }
         } else {
             content
+        }
+    }
+}
+
+
+/// 窗口安全区缓存：body 只读缓存；真正去窗口取值放到下一轮主线程，有变化才写回（触发重画）。
+@MainActor @Observable
+final class DYWindowInsets {
+    static let shared = DYWindowInsets()
+    private(set) var insets = UIEdgeInsets.zero
+    @ObservationIgnored private var pending = false
+    @ObservationIgnored private var observers: [NSObjectProtocol] = []
+
+    private init() {
+        let nc = NotificationCenter.default
+        for name in [UIDevice.orientationDidChangeNotification, UIScene.didActivateNotification,
+                     UIApplication.didBecomeActiveNotification] {
+            observers.append(nc.addObserver(forName: name, object: nil, queue: .main) { _ in
+                MainActor.assumeIsolated { DYWindowInsets.shared.scheduleRefresh() }
+            })
+        }
+    }
+
+    func read() -> UIEdgeInsets { scheduleRefresh(); return insets }
+
+    private func scheduleRefresh() {
+        guard !pending else { return }
+        pending = true
+        DispatchQueue.main.async { [self] in
+            pending = false
+            let v = UIApplication.shared.connectedScenes
+                .compactMap { ($0 as? UIWindowScene)?.keyWindow }.first?.safeAreaInsets ?? .zero
+            if v != insets { insets = v }
         }
     }
 }

@@ -26,7 +26,25 @@ final class DYMessageCache: ObservableObject {
     @Published var unfollowedRows: [DYConversationRow] = []
     /// sec_uid → follow_status（0 未关注 / 1 已关注 / 2 互关），落盘让下次进来分类不闪
     @Published var follow: [String: Int] = [:]
+    /// sec_uid → follower_status（对方有没有关注我：0 没有 / >0 关注了我）。和 follow 同一次请求拿到。
+    @Published var follower: [String: Int] = [:]
     private var followChecked = Set<String>()
+
+    /// 名字旁的关系标签，文案与抖音网页版关注按钮一致（webpack 常量 vc：
+    /// Followed「已关注」/ FollowEach「相互关注」/ FollowByOther「回关」= 对方关注了我、我没关注）。
+    /// 消息列表里「回关」读起来像按钮，换成「关注了你」，意思相同；「已关注」不打标（默认情况，打了是噪音）。
+    /// 对方关注了我（follower_status > 0，含互关）→ 头像上的红心（老板 2026-11-20 定：红心 = 别人关注我）
+    func followsMe(_ row: DYConversationRow) -> Bool {
+        guard row.kind == 1, let sec = row.sec, !sec.isEmpty else { return false }
+        return (follower[sec] ?? 0) > 0 || follow[sec] == 2
+    }
+
+    func relationLabel(_ row: DYConversationRow) -> DYRelationLabel? {
+        guard row.kind == 1, let sec = row.sec, !sec.isEmpty else { return nil }
+        // 「粉丝」已由头像红心表达，名字旁只留「相互关注」
+        let label = DYRelationLabel.from(follow: follow[sec], follower: follower[sec])
+        return label == .mutual ? label : nil
+    }
     /// Local to this account. Hiding never deletes the official conversation or history.
     @Published private(set) var hiddenConversations: [String: DYConversationRow] = [:]
 
@@ -68,32 +86,38 @@ final class DYMessageCache: ObservableObject {
           try {
             const r = await fetch('/aweme/v1/web/user/profile/other/?device_platform=webapp&aid=6383&sec_user_id=' + encodeURIComponent(s), { credentials: 'include' });
             const u = (JSON.parse(await r.text()) || {}).user || {};
-            if (typeof u.follow_status === 'number') out[s] = u.follow_status;
+            if (typeof u.follow_status === 'number') out[s] = [u.follow_status, typeof u.follower_status === 'number' ? u.follower_status : -1];
           } catch (e) {}
         }));
         return JSON.stringify(out);
         """
         guard let str = try? await web.callAsyncJavaScript(js, arguments: ["secs": need], contentWorld: .page) as? String,
               let d = str.data(using: .utf8),
-              let m = try? JSONDecoder().decode([String: Int].self, from: d) else {
+              let pairs = try? JSONDecoder().decode([String: [Int]].self, from: d) else {
             if scope == account { need.forEach { followChecked.remove($0) } }
             return
         }
         guard scope == account else { return }
+        let m = pairs.compactMapValues { $0.first }
+        let fm = pairs.compactMapValues { $0.count > 1 && $0[1] >= 0 ? $0[1] : nil }
         need.filter { m[$0] == nil }.forEach { followChecked.remove($0) }
         follow.merge(m) { _, new in new }
-        snapshot.follow = follow; save()
-        DYLiveModel.log("DDSTRANGER follow resolved=\(m.count) unfollowed=\(m.values.filter { $0 == 0 }.count)")
+        follower.merge(fm) { _, new in new }
+        snapshot.follow = follow; snapshot.follower = follower; save()
+        DYLiveModel.log("DDSTRANGER follow resolved=\(m.count) unfollowed=\(m.values.filter { $0 == 0 }.count) fans=\(fm.values.filter { $0 > 0 }.count)")
     }
     struct Snapshot: Codable {
         /// 结构版本：DYNotice 加了 images（评论配图）后升 2；旧文件缺该字段，消息页必须作废重拉
         var v: Int = 1
-        static let currentV = 2
+        /// 3：通知 author 加了 follow/follower（互动消息头像红心 / 粉丝标签），旧缓存没有 → 清一次重拉
+        /// 4：@我的（type 45）以前解析成空白「通知」，旧缓存里的这些行要重拉
+        static let currentV = 4
         var pages: [String: DYCachedNoticePage] = [:]
         var counts: [Int: Int] = [:]
         var friends: [DYFriend] = []
         var conversations: [DYConversationRow] = []
         var follow: [String: Int]?
+        var follower: [String: Int]?
         var friendCursor: String?
         var friendHasMore: Bool?
         var hiddenConversations: [String: DYConversationRow]?
@@ -129,7 +153,7 @@ final class DYMessageCache: ObservableObject {
                 scope = DYMessageFixture.scope
                 snapshot = Snapshot()
                 selectedChat = nil; strangerRows = []; strangerUnread = nil; unfollowedRows = []
-                follow = [:]; followChecked = []; hiddenConversations = [:]
+                follow = [:]; follower = [:]; followChecked = []; hiddenConversations = [:]
             }
             return
         }
@@ -155,11 +179,11 @@ final class DYMessageCache: ObservableObject {
         var fresh = Snapshot(); fresh.v = Snapshot.currentV
         snapshot = fresh; lastSavedData = nil
         if let file, let data = try? Data(contentsOf: file), var cached = try? JSONDecoder().decode(Snapshot.self, from: data) {
-            if cached.v < 2 {
+            if cached.v < Snapshot.currentV {
                 // 旧缓存的评论通知没有 images 字段且 refresh 不会重取老通知：作废消息页重拉（朋友/会话历史保留）
                 cached.pages = [:]
                 cached.v = Snapshot.currentV
-                DYLiveModel.log("DDMSGCACHE schema v<2 → pages cleared")
+                DYLiveModel.log("DDMSGCACHE schema v<\(Snapshot.currentV) → pages cleared")
             }
             snapshot = cached; lastSavedData = data
             // 旧版写进缓存的 ddimg:// 头像还原成原地址：原生列表加载不了 ddimg，那 20 个好友头像就是这么空的
@@ -171,7 +195,7 @@ final class DYMessageCache: ObservableObject {
             if repaired > 0 { lastSavedData = nil; save(); DYLiveModel.log("DDMSGCACHE repaired ddimg avatars=\(repaired)") }
         }
         selectedChat = nil; strangerRows = []; strangerUnread = nil; unfollowedRows = []
-        follow = snapshot.follow ?? [:]; followChecked = []
+        follow = snapshot.follow ?? [:]; follower = snapshot.follower ?? [:]; followChecked = []
         hiddenConversations = snapshot.hiddenConversations ?? [:]
         DYPeopleCache.shared.activate(scope: scope)
         if !DYPeopleCache.shared.hasFriendsSnapshot && !snapshot.friends.isEmpty {
@@ -214,7 +238,9 @@ final class DYMessageCache: ObservableObject {
         for batch in 0..<12 {
             let fresh = try await bridge.notices(group: group, maxTime: cursor, minTime: boundary)
             guard scope == account else { throw CancellationError() }
-            if batch == 0 { initialCursor = fresh.maxTime; initialMore = fresh.hasMore }
+            // 翻页游标要停在「已拉到的最后一页」之后：以前只记第 1 页的游标，空缓存首拉 3 页后，
+            // 下滑分页从第 2 页重拉 → 全是已有的 → 列表不增长、转圈不再触发，就卡在第一屏（2026-11-20 老板报）
+            if batch == 0 || old == nil { initialCursor = fresh.maxTime; initialMore = fresh.hasMore }
             incoming.append(contentsOf: fresh.items)
             if !fresh.hasMore || fresh.items.isEmpty || fresh.maxTime == cursor || fresh.items.contains(where: { known.contains($0.id) }) { break }
             // 没有缓存（或缓存不足一页）时也要连拉几页：抖音单页只给 10 条，
@@ -232,7 +258,34 @@ final class DYMessageCache: ObservableObject {
         return result
     }
     func store(_ page: DYCachedNoticePage, group: Int) { snapshot.pages[String(group)] = page; save() }
+    /// 刚标已读的分组 → 时间。抖音标已读后未读数接口要过一会才归零，期间以本地 0 为准，
+    /// 否则返回后角标还在，要再点进别的分类（再触发一次刷新）才清掉（老板 2026-11-20 报）。
+    private var justRead: [Int: Date] = [:]
+    /// 服务端未读数 → 显示用：刚读过的分组在 30 秒内按 0 显示
+    func applyReadMask(_ server: [Int: Int]) -> [Int: Int] {
+        let now = Date()
+        justRead = justRead.filter { now.timeIntervalSince($0.value) < 30 }
+        var out = server
+        for g in justRead.keys { out[g] = 0 }
+        return out
+    }
+    /// 底栏「信息」总角标：刚读过的分组从总数里扣掉（总数 700 是服务端合计，同样滞后）
+    func maskedBadge(_ groups: [DYNoticeCount]) -> Int {
+        let raw = Dictionary(groups.map { ($0.group, $0.count) }, uniquingKeysWith: { a, _ in a })
+        let masked = applyReadMask(raw)
+        let parts = [DYNoticeGroup.comment, .digg, .fans, .system].map(\.rawValue)
+        let cleared = parts.reduce(0) { $0 + ((raw[$1] ?? 0) - (masked[$1] ?? 0)) }
+        if let all = raw[DYNoticeGroup.all.rawValue] { return max(0, all - cleared) }
+        return parts.reduce(0) { $0 + (masked[$1] ?? 0) }
+    }
+    /// 退出分类时先在本地把角标清零（立即生效），再去服务端标已读
+    func clearCountsLocally(_ groups: Set<Int>) {
+        guard !groups.isEmpty else { return }
+        let now = Date()
+        for g in groups { justRead[g] = now; snapshot.counts[g] = 0 }
+    }
     func markReadAfterExit(_ groups: Set<Int>, bridge: DouyinBridge) async {
+        clearCountsLocally(groups)
         for group in groups {
             do {
                 _ = try await bridge.notices(group: group, maxTime: 0, markRead: true)
@@ -250,7 +303,7 @@ final class DYMessageCache: ObservableObject {
             } catch { DYLiveModel.log("DDNOTICE read-on-exit failed group=\(group)") }
         }
         if let values = try? await bridge.noticeCounts() {
-            snapshot.counts = Dictionary(values.map { ($0.group, $0.count) }, uniquingKeysWith: { a, _ in a })
+            snapshot.counts = applyReadMask(Dictionary(values.map { ($0.group, $0.count) }, uniquingKeysWith: { a, _ in a }))
         }
         save()
     }
@@ -356,8 +409,12 @@ enum DYNoticeGroup: Int, CaseIterable, Identifiable {
     case all = 700
     case comment = 2
     case digg = 3
+    /// @我的（网页版 noticeGroupMap 9→6，2026-11-22 从官方 JS 读出）
+    case at = 6
     case fans = 401
     case system = 961
+    /// 推荐：分组号不固定，由 notice/count 的 interactive_group（type "26"）下发；这里只是占位键
+    case recommend = -26
 
     var id: Int { rawValue }
     var title: String {
@@ -365,9 +422,43 @@ enum DYNoticeGroup: Int, CaseIterable, Identifiable {
         case .all: "全部"
         case .comment: "评论"
         case .digg: "赞"
+        case .at: "@我的"
         case .fans: "粉丝"
         case .system: "系统"
+        case .recommend: "推荐"
         }
+    }
+
+    /// 实际请求 / 缓存用的分组号。推荐没拿到服务端分组号时退回 700，再在本地只留推荐类条目
+    var requestGroup: Int {
+        guard self == .recommend else { return rawValue }
+        return DYNoticeGroupMap.group(forType: "26") ?? DYNoticeGroup.all.rawValue
+    }
+    /// 推荐退回 700 时要本地过滤
+    var filtersLocally: Bool { self == .recommend && DYNoticeGroupMap.group(forType: "26") == nil }
+
+    /// 在这个筛选里看过，退出时也要标已读的分组（互动页本身的 2/3 由路由给）
+    var extraReadGroups: [Int] {
+        switch self {
+        case .at: [DYNoticeGroup.at.rawValue]
+        case .fans: [DYNoticeGroup.fans.rawValue]
+        case .recommend: DYNoticeGroupMap.group(forType: "26").map { [$0] } ?? []
+        default: []
+        }
+    }
+}
+
+/// 网页版 notice/count 下发的 interactive_group（[{type:"26", group:N}]）：推荐等动态分组号。存 UserDefaults，下次启动直接可用
+enum DYNoticeGroupMap {
+    private static let key = "douduo_notice_group_map_v1"
+    static func group(forType t: String) -> Int? {
+        (UserDefaults.standard.dictionary(forKey: key) as? [String: Int])?[t]
+    }
+    static func update(_ pairs: [DYNoticeInteractiveGroup]) {
+        guard !pairs.isEmpty else { return }
+        var m = (UserDefaults.standard.dictionary(forKey: key) as? [String: Int]) ?? [:]
+        for p in pairs where p.group != 0 { m[p.type] = p.group }
+        UserDefaults.standard.set(m, forKey: key)
     }
 }
 
@@ -398,7 +489,8 @@ enum DYMsgRoute: Hashable {
     /// 标题下拉可切的接口分组（互动页 = 全部/评论/赞）
     var filters: [DYNoticeGroup] {
         switch self {
-        case .interactive: [.all, .comment, .digg]
+        // 对齐网页版「互动消息」下拉：全部 / 粉丝 / @我的 / 评论 / 赞 / 推荐（网页版本身也不显示「弹幕」）
+        case .interactive: [.all, .fans, .at, .comment, .digg, .recommend]
         case .fans: [.fans]
         case .system: [.system]
         case .stranger: []
@@ -408,16 +500,18 @@ enum DYMsgRoute: Hashable {
     func filterTitle(_ g: DYNoticeGroup) -> String {
         guard self == .interactive else { return title }
         switch g {
-        case .comment: return "评论"
-        case .digg: return "赞"
-        default: return "全部互动"
+        case .all, .system: return "全部互动"
+        default: return g.title
         }
     }
 }
 
-/// notice 列表里的 type（不是 group）：31 评论 / 41 赞 / 9009 推荐 / 33 关注
+/// notice 列表里的 type（不是 group）：31 评论 / 41 赞 / 45 @ / 9009 推荐 / 33 关注
 enum DYNoticeKind {
     static let follow = 33
+    static let mention = 45
+    /// 网页版 I6：RECOMMEND 9009 / FOLLOW_RECOMMEND 9002 / FOLLOW_DIGG_RECOMMEND 514 / FOLLOWER_DIGG_RECOMMEND 9067
+    static let recommend: Set<Int> = [9009, 9002, 514, 9067]
     static func isInteractive(_ n: DYNotice) -> Bool {
         n.type != follow && (n.author != nil || (n.awemeID ?? "").isEmpty == false)
     }
@@ -440,6 +534,8 @@ struct DYMessagesScreen: View {
     /// 打开时先显示哪一页：点「我的」进来就是「我的」，点「信息」进来就是信息（老板 2026-11-17）
     var startsOnMine = false
     @State private var showingMine = false
+    /// 「我的」第一次切过去后就常驻（隐藏而不销毁），之后信息 ⇄ 我的来回切不再重建、不重拉资料和作品
+    @State private var mineMounted = false
     let onWeb: (URL) -> Void
     var forwardedShare: DYForwardReceipt? = nil
 
@@ -512,6 +608,8 @@ struct DYMessagesScreen: View {
     @State private var chatStatus = "正在加载私信…"
     /// 聊天里点朋友分享的视频 → 原生播放器（网页 ddMsg 通道触发）
     @State private var videoPlay: DYMessagePlay?
+    /// 私信里点开的图片（原生看大图）
+    @State private var photo: DYPhotoViewerTarget?
     /// 顶部头像栏 = 朋友（互相关注），来自 familiar/atlist，不是粉丝
     @State private var friends: [DYFriend] = []
     @State private var counts: [Int: Int] = [:]
@@ -673,10 +771,35 @@ struct DYMessagesScreen: View {
         .task {
             // 网页聊天页 → App：点分享视频卡片跳原生播放（DouyinWebView 的 ddMsg 通道）
             if #available(iOS 27.1, *) { DYLiveModel.log("DDMSG layout=resizable") } else { DYLiveModel.log("DDMSG layout=legacy") }
+            // 聊天里点对方头像/昵称：网页会整页跳 /user/<sec>（网页版主页）→ 拦下改开原生作者主页
+            chatModel.onUserLink = { sec in
+                Task { @MainActor in self.openUser(sec: sec) }
+            }
             chatModel.onAppMessage = { json in
                 guard let data = json.data(using: .utf8),
                       let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
                 switch obj["type"] as? String {
+                case "user":
+                    guard let sec = obj["sec"] as? String, !sec.isEmpty else { return }
+                    DYLiveModel.log("DDMSGUSER intercept click sec=\(sec.prefix(12))")
+                    Task { @MainActor in self.openUser(sec: sec) }
+                case "photo":
+                    // 网络原图优先；拿不到原图时网页给的是内嵌 base64 缩略图（data:），也照样能看
+                    let urls = ((obj["urls"] as? [String]) ?? []).compactMap(URL.init(string:))
+                        .filter { ["https", "http", "data"].contains($0.scheme ?? "") }
+                    let i = (obj["index"] as? NSNumber)?.intValue ?? 0
+                    let shown: [Data?] = ((obj["shown"] as? [Any]) ?? []).map { v in
+                        guard let s = v as? String, let comma = s.firstIndex(of: ",") else { return nil }
+                        return Data(base64Encoded: String(s[s.index(after: comma)...]), options: .ignoreUnknownCharacters)
+                    }
+                    DYLiveModel.log("DDPHOTO open n=\(urls.count) i=\(i) src=\(obj["src"] as? String ?? "-") shown=\(shown.compactMap { $0?.count }.map(String.init).joined(separator: ",")) sizes=\(obj["sizes"] as? String ?? "-")")
+                    guard !urls.isEmpty || shown.contains(where: { $0 != nil }) else { return }
+                    let pics = urls.isEmpty ? shown.map { _ in URL(string: "data:,")! } : urls
+                    Task { @MainActor in self.photo = DYPhotoViewerTarget(urls: pics, start: i, fallbacks: shown) }
+                case "photo-miss":
+                    DYLiveModel.log("DDPHOTO miss cls=\(obj["cls"] as? String ?? "-") box=\(obj["box"] as? String ?? "-")")
+                case "preview-open", "preview-close":
+                    DYLiveModel.log("DDCHATPREVIEW \(obj["type"] as? String ?? "-") why=\(obj["why"] as? String ?? "-") closed=\(obj["closed"] as? Bool ?? false)")
                 case "msg-menu":
                     guard let token = obj["token"] as? String, !token.isEmpty else { return }
                     Task { @MainActor in self.deletingMessageToken = token }
@@ -712,6 +835,7 @@ struct DYMessagesScreen: View {
                 }
             }
         }
+        .dyPhotoViewer($photo)
         .fullScreenCover(item: $videoPlay) { p in
             // 信息里点开的分享视频：一关掉就把它的声音彻底收掉（见 DYListPlayer.hardStopOnDismiss）
             DYListPlayer(bridge: bridge, title: p.item.desc.isEmpty ? "视频" : p.item.desc,
@@ -732,6 +856,9 @@ struct DYMessagesScreen: View {
             // 只有真正退出分类才标已读；打开视频/作者弹层不算退出分类。
             guard old != current, case .category(let route) = old else { return }
             let seen = viewedGroups.removeValue(forKey: route) ?? []
+            // 返回时角标立即清零，不等网络
+            DYMessageCache.shared.clearCountsLocally(seen)
+            counts = DYMessageCache.shared.snapshot.counts
             Task {
                 await DYMessageCache.shared.markReadAfterExit(seen, bridge: bridge)
                 counts = DYMessageCache.shared.snapshot.counts
@@ -741,6 +868,8 @@ struct DYMessagesScreen: View {
         .onAppear { chatSurfaceActive = true }
         .onDisappear {
             chatSurfaceActive = false
+            // 聊天网页关掉后还常驻（下次秒开）：里面正在放的视频/语音必须停，否则退出信息页还在出声
+            DYChatMedia.silence(chatModel.web, reason: "messages-close")
             DYMessageCache.shared.retainChat()
         }
     }
@@ -759,9 +888,11 @@ struct DYMessagesScreen: View {
             } else {
             DYAdaptiveActionRail { systemEdge in
                 GeometryReader { safe in
-                    let edge = HorizontalEdge.trailing
-                    // 系统竖栏也在右边时，栏居中到那一列；系统竖栏在左边（横屏）时右边没有系统列，离边 12
-                    let column = systemEdge == .trailing ? safe.safeAreaInsets.trailing : 0
+                    // 全屏时一律放右边（老板定）。分屏且系统竖栏在左（DouDuo 在左半屏）时跟视频页一样进左边那一列，
+                    // 否则左边那一列空着成黑边、侧栏挤在中间（粉丝反馈 11-23，老板截图确认）
+                    let edge: HorizontalEdge = systemEdge == .leading && DYWindowSplit.isSplit ? .leading : .trailing
+                    // 系统竖栏和侧栏同一边时，栏居中到那一列；不同边时离边 12
+                    let column = systemEdge == edge ? (edge == .leading ? safe.safeAreaInsets.leading : safe.safeAreaInsets.trailing) : 0
                     // 跟视频页同一公式：有系统竖栏时栏居中在那一列（+光学微调）；没有时离边 12
                     let outer = column > 0 ? max(0, (column - Self.railWidth) / 2 + theme.media.expandedRailOpticalInset) : 12
                     // 内容区右侧要让出：栏宽 + 栏外留白 − 系统竖栏本身（那一列内容区本来就不占）
@@ -771,13 +902,16 @@ struct DYMessagesScreen: View {
                             .padding(edge == .leading ? .leading : .trailing, reserve)
                             .opacity(showingMine ? 0 : 1)
                             .allowsHitTesting(!showingMine)
-                        if showingMine, let mineContent {
+                        if showingMine || mineMounted, let mineContent {
                             // 外层整页忽略了顶部安全区；「我的」自带导航栏，内容要让开状态栏 + 导航栏，
                             // 否则页头（含「去登录」）被导航栏盖住、点不到（老板 2026-11-17「点击登录无反应」）。
                             mineContent
                                 .safeAreaPadding(.top, messageTopInset)
                                 .padding(edge == .leading ? .leading : .trailing, reserve)
-                                .transition(.opacity)
+                                .opacity(showingMine ? 1 : 0)
+                                .allowsHitTesting(showingMine)
+                                .accessibilityHidden(!showingMine)
+                                .onAppear { mineMounted = true }
                         }
                         messageRail
                             .padding(.horizontal, outer)
@@ -940,7 +1074,7 @@ struct DYMessagesScreen: View {
         // 跟视频页右侧栏同一套避让：状态栏（时间/信号环）显示时是系统遮挡区，
         // 聊天页多一颗「更多」栏变高，返回键会顶进去被盖住。只量栏本身（不含 Spacer），
         // 被挡住就整列往下让，最多让进底部 92pt 留白；状态栏隐藏时不动。
-        .modifier(DYRailReservedNudge(railEdge: .trailing, verticalSpace: 0...92, disabled: keyboardFrame != nil))
+        .modifier(DYRailReservedNudge(railEdge: DYWindowSplit.isSplit ? .leading : .trailing, verticalSpace: 0...92, disabled: keyboardFrame != nil))
         // 底部位置跟视频页一致：离底 92pt。
         // 键盘弹出时底部安全区（home 条那一段）消失，贴底排的栏会被顶上去一截 —— 补回来，栏就不动。
         .padding(.bottom, keyboardFrame == nil ? 92 : 92 - keyboardBottomInset)
@@ -1051,7 +1185,7 @@ struct DYMessagesScreen: View {
             }
             ForEach(friendConversations) { row in
                 Button { Task { await openConversation(row) } } label: {
-                    DYConversationCell(row: row, compact: compactSidebar)
+                    DYConversationCell(row: row, compact: compactSidebar, relation: cache.relationLabel(row), followsMe: cache.followsMe(row))
                 }
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("douyin.conversation.row")
@@ -1320,6 +1454,7 @@ struct DYMessagesScreen: View {
         let wasStranger = cache.selectedChat?.stranger == true
         cache.selectedChat = nil
         chatModel.web?.endEditing(true)
+        DYChatMedia.silence(chatModel.web, reason: "chat-back")
         Task {
             if let web = chatModel.web {
                 // 网页切回列表之前，把刚看的聊天画面（含最新消息）截下来，下次进这条会话直接铺
@@ -1357,13 +1492,13 @@ struct DYMessagesScreen: View {
                     let active = visible
                     Group {
                         if route == .stranger {
-                            DYStrangerListScreen(isActive: active, embedded: true,
+                            DYStrangerListScreen(isActive: active, embedded: true, topInset: messageTopInset,
                                 onOpen: { row in navigation.openChat(row.id, from: .stranger) },
                                 onOpeningChanged: { openingChat = $0 ? "stranger" : nil })
                         } else {
                             DYNoticeListScreen(bridge: bridge, route: route, onWeb: onWeb,
                                 onViewedGroup: { group in viewedGroups[route, default: []].insert(group) },
-                                isActive: active, embedded: true)
+                                isActive: active, embedded: true, topInset: messageTopInset)
                         }
                     }
                     .offset(x: !sidebarVisible && !reduceMotion && navigation.isChat && navigation.category == route
@@ -1761,7 +1896,7 @@ struct DYMessagesScreen: View {
         #endif
         DYLiveModel.log("DDMSGCACHE restore root=\(recent.count) chats=\(conversations.count) friends=\(friends.count)")
         if let groups = try? await bridge.noticeCounts() {
-            counts = Dictionary(groups.map { ($0.group, $0.count) }, uniquingKeysWith: { a, _ in a })
+            counts = cache.applyReadMask(Dictionary(groups.map { ($0.group, $0.count) }, uniquingKeysWith: { a, _ in a }))
             cache.snapshot.counts = counts
         }
         do {
@@ -1789,6 +1924,15 @@ struct DYMessagesScreen: View {
         guard !f.secUid.isEmpty else { return }
         chatAuthor = .init(name: f.name, avatar: f.avatar, secUid: f.secUid)
     }
+
+    /// 聊天网页里点了某人的头像/昵称（sec_uid）：用已知的会话/朋友资料补名字和头像，打开原生作者主页
+    private func openUser(sec: String) {
+        guard !sec.isEmpty, chatAuthor?.secUid != sec else { return }
+        let row = (conversations + cache.strangerRows + cache.unfollowedRows).first { $0.sec == sec }
+        let friend = friends.first { $0.secUid == sec }
+        chatAuthor = .init(name: row?.name ?? friend?.name ?? "", avatar: row?.avatar ?? friend?.avatar, secUid: sec)
+        DYLiveModel.log("DDMSGUSER open native author sec=\(sec.prefix(12)) known=\(row != nil || friend != nil)")
+    }
 }
 
 // MARK: - 二级页（互动 / 粉丝 / 系统）
@@ -1800,6 +1944,9 @@ struct DYNoticeListScreen: View {
     let onViewedGroup: (Int) -> Void
     let isActive: Bool
     let embedded: Bool
+    /// 嵌在信息页右侧时外层整页忽略了顶部安全区：标题行要让开状态栏，否则「全部互动」下拉落在系统导航栏底下，点不到
+    /// （老板 2026-11-22：展开大屏竖屏点不了）。跟左侧「消息」标题同一个值，两边顶部对齐。
+    var topInset: CGFloat = 0
     @Environment(\.appTheme) private var theme
     @Environment(\.colorScheme) private var scheme
     @ObservedObject private var emojiStore = DYEmojiStore.shared
@@ -1826,13 +1973,17 @@ struct DYNoticeListScreen: View {
     @State private var replyErr: String?
     @State private var showRelogin = false
     @State private var replied: Set<String> = []
+    /// 点赞名单（赞通知「等 N 人」）
+    @State private var diggList: String?
+    @State private var approved: Set<String> = []
     @State private var toast: String?
     @FocusState private var replyFocused: Bool
     /// 整页现在不跟键盘避让（右侧栏会错位），回复栏自己垫到键盘上方
     @State private var replyKeyboardInset: CGFloat = 0
 
     init(bridge: DouyinBridge, route: DYMsgRoute, onWeb: @escaping (URL) -> Void, onViewedGroup: @escaping (Int) -> Void,
-         isActive: Bool = true, embedded: Bool = false) {
+         isActive: Bool = true, embedded: Bool = false, topInset: CGFloat = 0) {
+        self.topInset = topInset
         self.bridge = bridge
         self.route = route
         self.onWeb = onWeb
@@ -1841,7 +1992,7 @@ struct DYNoticeListScreen: View {
         self.embedded = embedded
         let group = route.filters.first ?? .all
         _group = State(initialValue: group)
-        let cached = DYMessageCache.shared.page(group.rawValue)
+        let cached = DYMessageCache.shared.page(group.requestGroup)
         _items = State(initialValue: cached?.items ?? [])
         _maxTime = State(initialValue: cached?.maxTime ?? 0)
         _hasMore = State(initialValue: cached?.hasMore ?? true)
@@ -1859,7 +2010,7 @@ struct DYNoticeListScreen: View {
         .task(id: "\(group.rawValue):\(isActive)") {
             guard isActive else { return }
             // 进哪个分类就记下它对应的服务端分组，退出时一起标已读（评论+赞同属互动）
-            route.readGroups.forEach { onViewedGroup($0) }
+            (route.readGroups + group.extraReadGroups).forEach { onViewedGroup($0) }
             if loadedGroup != group {
                 let requested = group
                 await reload(reset: true)
@@ -1883,9 +2034,12 @@ struct DYNoticeListScreen: View {
             .presentationDetents([.medium, .large])
             .presentationBackground(Color.ddBackground)
         }
+        .sheet(item: Binding(get: { diggList.map { DYMoveRequest(ids: [$0]) } }, set: { diggList = $0?.ids.first })) { r in
+            DYDiggUsersScreen(bridge: bridge, awemeID: r.ids[0]) { a in diggList = nil; author = a }
+        }
         .fullScreenCover(item: $player) { p in
             DYListPlayer(bridge: bridge, title: p.item.desc.isEmpty ? "视频" : p.item.desc, items: [p.item], start: 0,
-                         onAuthor: { author = $0.author }, commentFocus: p.focus)
+                         onAuthor: { author = $0.author }, commentFocus: p.focus, hardStopOnDismiss: true)
         }
         .safeAreaInset(edge: .bottom) { if replying != nil { replyBar.padding(.bottom, replyKeyboardInset) } }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { note in
@@ -1929,6 +2083,8 @@ struct DYNoticeListScreen: View {
                     }
                     Spacer(minLength: 0)
                 }
+                .frame(minHeight: theme.messages.headerHeight)
+                .padding(.top, topInset)
                 .background(Color.ddBackground)
                 Divider()
                 list
@@ -1976,7 +2132,16 @@ struct DYNoticeListScreen: View {
                         .accessibilityIdentifier("douyin.notice.reply.cancel")
                 }
             }
-            if let e = replyErr { Text(e).font(.caption2).foregroundStyle(.red) }
+            if replyErr == DYCommentPanel.waitSignText {
+                DYSignWaitHint(bridge: bridge, color: .red).accessibilityIdentifier("douyin.notice.reply.err")
+                    .onReceive(bridge.$signReady) { ok in
+                        guard ok else { return }
+                        replyErr = DYCommentPanel.signDoneText
+                        Task { @MainActor in try? await Task.sleep(for: .seconds(3)); if replyErr == DYCommentPanel.signDoneText { replyErr = nil } }
+                    }
+            } else if let e = replyErr {
+                Text(e).font(.caption2).foregroundStyle(e == DYCommentPanel.signDoneText ? .green : .red).accessibilityIdentifier("douyin.notice.reply.err")
+            }
             HStack(spacing: 8) {
                 TextField("回复评论…", text: $replyDraft, axis: .vertical)
                     .lineLimit(1...4)
@@ -2008,6 +2173,13 @@ struct DYNoticeListScreen: View {
     }
 
     private func startReply(_ n: DYNotice) {
+        // 老板 11-19：通知里直接回复屡次「显示成功却看不到」，评论区里回复一直正常。
+        // 有视频和评论 id 的，一律打开那条视频的评论区并进入「回复 @它」，用评论区同一套发送。
+        if n.commentFocus != nil {
+            DYLiveModel.log("DDNOTICEREPLY via=comment-panel")
+            Task { await open(n, reply: true) }
+            return
+        }
         if replying?.id != n.id { replyDraft = "" }
         replying = n; replyErr = nil
         replyFocused = true
@@ -2021,20 +2193,40 @@ struct DYNoticeListScreen: View {
         guard let n = replying, let aweme = n.awemeID, let cid = n.cid else { return }
         let text = replyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !replySending else { return }
+        guard bridge.signReady else {
+            replyErr = DYCommentPanel.waitSignText
+            DYLiveModel.log("DDSIGN reply-blocked waiting")
+            Task { await bridge.prepareSigning() }
+            return
+        }
         replySending = true
         defer { replySending = false }
         do {
             // 一级评论：reply_id = 它；楼中楼：reply_id = 一级评论、reply_to_reply_id = 这条（网页同款）
-            _ = try await bridge.publishComment(aweme, text: text, replyID: n.parentCid ?? cid,
-                                                replyToReplyID: n.parentCid == nil ? nil : cid)
+            let thread = n.threadParent ?? cid
+            let sent = try await bridge.publishComment(aweme, text: text, replyID: thread,
+                                                       replyToReplyID: n.threadParent == nil ? nil : cid)
             replied.insert(n.id)
             closeReply()
-            showToast("已回复")
+            showToast("已发出，正在核对评论区…")
+            // 抖音回了成功也可能看不到（挂错楼 / 被折叠）：回头真去那条评论的回复里找，找不到就照实说
+            let visible = await bridge.replyIsVisible(aweme, thread: thread, id: sent.id)
+            DYLiveModel.log("DDNOTICEREPLY visible=\(visible.map { $0 ? "yes" : "no" } ?? "unknown") thread=\(thread) id=\(sent.id)")
+            switch visible {
+            case true?: showToast("已回复，评论区可见")
+            case false?:
+                replied.remove(n.id)
+                replyErr = "抖音收下了，但这条回复在评论区里找不到（可能被折叠或仅自己可见）。可以点视频进评论区核对。"
+                replying = n
+            case nil: showToast("已发出，评论区暂时核对不了")
+            }
         } catch is DYLoginExpired {
             // 回复框和草稿留着：重新登录后再点一次发送
             replyErr = "抖音拦下了这次回复（需要验证或暂时受限）；登录和草稿已保留，请选择恢复方式"
             replyFocused = false
             DYRelogin.start { showRelogin = true }
+        } catch let e as DYCommentUnconfirmed {
+            replyErr = e.message + "，草稿已保留，勿连续重发"
         } catch {
             replyErr = "发送失败：\(error.localizedDescription)"
         }
@@ -2045,8 +2237,9 @@ struct DYNoticeListScreen: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { if toast == s { toast = nil } }
     }
 
-    /// 互动「全部」走 700 分组，要剔掉关注和系统类
+    /// 互动「全部」走 700 分组，要剔掉关注和系统类；推荐没拿到分组号时同样借 700，只留推荐类
     private var visibleItems: [DYNotice] {
+        if group.filtersLocally { return items.filter { DYNoticeKind.recommend.contains($0.type) } }
         guard route == .interactive, group == .all else { return items }
         return items.filter(DYNoticeKind.isInteractive)
     }
@@ -2072,14 +2265,30 @@ struct DYNoticeListScreen: View {
                         VStack(alignment: .leading, spacing: 0) {
                             Button { Task { await open(n) } } label: { row(n) }
                                 .buttonStyle(.plain)
+                                .contextMenu {
+                                    Button("删除这条通知", systemImage: "trash", role: .destructive) { Task { await deleteNotice(n) } }
+                                        .accessibilityIdentifier("douyin.notice.delete")
+                                }
                                 .accessibilityIdentifier(n.isComment ? "douyin.notice.comment" : (n.awemeID == nil ? "douyin.notice.author" : "douyin.notice.video"))
                                 .accessibilityValue(n.hasRead ? "已读" : "未读")
                             if n.isComment { commentActions(n) }
+                            if n.isFollowRequest { followRequestActions(n) }
+                            if (n.diggCount ?? 0) > 1, let aid = n.awemeID, !aid.isEmpty {
+                                Button { diggList = aid } label: {
+                                    Label("查看全部 \(n.diggCount ?? 0) 个赞", systemImage: "person.2")
+                                        .font(.caption).padding(.leading, 54).padding(.bottom, 8)
+                                }
+                                .buttonStyle(.plain)
+                                .foregroundStyle(Color.primary.opacity(0.6))
+                                .accessibilityIdentifier("douyin.notice.digglist")
+                            }
                         }
                         Divider().background(Color.primary.opacity(0.08))
                     }
                     if hasMore {
+                        // id 跟条数走：加载完一页后转圈仍在屏幕上也会重新触发下一页
                         ProgressView().tint(.primary).padding()
+                            .id(items.count)
                             .onAppear { Task { await reload(reset: false) } }
                     }
                 }
@@ -2088,8 +2297,18 @@ struct DYNoticeListScreen: View {
         }
     }
 
+    /// 互动消息里这个人和我的关系：通知自带 from_user 的 follow/follower_status；没有时退回私信查过的缓存
+    private func noticeRelation(_ n: DYNotice) -> (followsMe: Bool, label: DYRelationLabel?) {
+        let sec = n.author?.secUid ?? ""
+        let f = n.author?.follow ?? (sec.isEmpty ? nil : DYMessageCache.shared.follow[sec])
+        let fr = n.author?.follower ?? (sec.isEmpty ? nil : DYMessageCache.shared.follower[sec])
+        let label = DYRelationLabel.from(follow: f, follower: fr)
+        return ((fr ?? 0) > 0 || f == 2, label == .mutual ? label : nil)
+    }
+
     private func row(_ n: DYNotice) -> some View {
-        HStack(alignment: .top, spacing: 10) {
+        let rel = noticeRelation(n)
+        return HStack(alignment: .top, spacing: 10) {
             ZStack(alignment: .topTrailing) {
                 CachedAsyncImage(url: n.avatar.flatMap(URL.init(string:))) { img in
                     img.resizable().scaledToFill()
@@ -2098,14 +2317,18 @@ struct DYNoticeListScreen: View {
                 }
                 .frame(width: 44, height: 44)
                 .clipShape(Circle())
+                .overlay(alignment: .bottomTrailing) { if rel.followsMe { DYFollowingHeart().offset(x: 3, y: 3) } }
                 if !n.hasRead {
                     Circle().fill(Color.red).frame(width: 8, height: 8).offset(x: 2, y: -2)
                 }
             }
             VStack(alignment: .leading, spacing: 3) {
-                Text(n.name.isEmpty ? "抖音用户" : n.name)
-                    .font(.subheadline.weight(.semibold)).lineLimit(1)
-                if n.isComment {
+                HStack(spacing: 6) {
+                    Text(n.name.isEmpty ? "抖音用户" : n.name)
+                        .font(.subheadline.weight(.semibold)).lineLimit(1)
+                    if let label = rel.label { DYRelationTag(label: label) }
+                }
+                if n.isComment || n.isMention {
                     Text(n.action).font(.caption).foregroundStyle(Color.primary.opacity(0.5))
                     commentText(n)
                     if let q = n.quote, !q.isEmpty {
@@ -2179,6 +2402,61 @@ struct DYNoticeListScreen: View {
         else if truncated.contains(id) { truncated.remove(id) }
     }
 
+    /// 删除一条通知：抖音确认了才从列表和缓存里拿掉
+    private func deleteNotice(_ n: DYNotice) async {
+        do {
+            switch try await bridge.deleteNotice(n.id) {
+            case .ok:
+                items.removeAll { $0.id == n.id }
+                let g = group.requestGroup
+                if var page = DYMessageCache.shared.page(g) { page.items.removeAll { $0.id == n.id }; DYMessageCache.shared.store(page, group: g) }
+                showToast("已删除")
+            case .notLoggedIn: showToast("抖音未登录")
+            case .failed(let why): showToast("没删掉：" + why)
+            }
+        } catch { showToast("没删掉：" + error.localizedDescription) }
+    }
+
+    /// 关注请求（私密账号）：通过 / 拒绝（拒绝 = notice/del action_type 1）
+    private func followRequestActions(_ n: DYNotice) -> some View {
+        HStack(spacing: 12) {
+            if approved.contains(n.id) {
+                Text("已通过").font(.caption).foregroundStyle(.secondary)
+            } else {
+                Button("通过") {
+                    Task {
+                        guard let uid = n.author?.uid, !uid.isEmpty else { showToast("拿不到对方 id"); return }
+                        do {
+                            switch try await bridge.approveFollowRequest(uid: uid) {
+                            case .ok: approved.insert(n.id); showToast("已通过关注请求")
+                            case .notLoggedIn: showToast("抖音未登录")
+                            case .failed(let why): showToast("没通过：" + why)
+                            }
+                        } catch { showToast("没通过：" + error.localizedDescription) }
+                    }
+                }
+                .buttonStyle(.borderedProminent).tint(.pink)
+                .accessibilityIdentifier("douyin.notice.approve")
+                Button("拒绝") {
+                    Task {
+                        do {
+                            switch try await bridge.deleteNotice(n.id, rejectFollowRequest: true) {
+                            case .ok: items.removeAll { $0.id == n.id }; showToast("已拒绝")
+                            case .notLoggedIn: showToast("抖音未登录")
+                            case .failed(let why): showToast("没拒绝：" + why)
+                            }
+                        } catch { showToast("没拒绝：" + error.localizedDescription) }
+                    }
+                }
+                .buttonStyle(.bordered)
+                .accessibilityIdentifier("douyin.notice.reject")
+            }
+            Spacer(minLength: 0)
+        }
+        .font(.caption)
+        .padding(.leading, 54).padding(.bottom, 8)
+    }
+
     /// 评论下方：展开/收起 + 回复
     private func commentActions(_ n: DYNotice) -> some View {
         HStack(spacing: 18) {
@@ -2189,11 +2467,16 @@ struct DYNoticeListScreen: View {
                 } label: {
                     Label(open ? "收起" : "展开", systemImage: open ? "chevron.up" : "chevron.down")
                         .labelStyle(.titleAndIcon)
+                        // 老板 11-23：「展开」常点不到——按钮上下各留 10pt 可点区域，和正文/下一条拉开
+                        .padding(.vertical, 10).padding(.trailing, 8)
+                        .contentShape(Rectangle())
                 }
                 .accessibilityIdentifier("douyin.notice.expand")
             }
             Button { startReply(n) } label: {
                 Label(replied.contains(n.id) ? "已回复" : "回复", systemImage: "arrowshape.turn.up.left")
+                    .padding(.vertical, 10).padding(.trailing, 8)
+                    .contentShape(Rectangle())
             }
             .accessibilityIdentifier("douyin.notice.reply")
             Spacer(minLength: 0)
@@ -2203,8 +2486,9 @@ struct DYNoticeListScreen: View {
         .foregroundStyle(Color.primary.opacity(0.7))
         .padding(.leading, 70)
         .padding(.trailing, 16)
-        .padding(.top, -4)
-        .padding(.bottom, 12)
+        // 按钮自己带了上下 10pt 点按区，外边距相应收一点，整行视觉间距比原来宽松但不至于空
+        .padding(.top, 0)
+        .padding(.bottom, 4)
     }
 
     private func reload(reset: Bool) async {
@@ -2212,7 +2496,7 @@ struct DYNoticeListScreen: View {
         if !reset && (!hasMore || loading) { return }
         loadGen += 1
         let gen = loadGen
-        let requestedGroup = group.rawValue
+        let requestedGroup = group.requestGroup
         let cache = DYMessageCache.shared
         loading = true
         defer { if gen == loadGen { loading = false } }
@@ -2228,12 +2512,21 @@ struct DYNoticeListScreen: View {
             if reset {
                 page = try await cache.refresh(requestedGroup, bridge: bridge)
             } else {
-                let next = try await bridge.notices(group: requestedGroup, maxTime: maxTime)
+                // 游标落在已加载区间里时（旧缓存 / 首拉多页），整页都是重复的：继续往后翻，直到拿到新条目
                 let seen = Set(items.map(\.id))
-                page = DYCachedNoticePage(items: items + next.items.filter { !seen.contains($0.id) },
-                                          maxTime: next.maxTime,
-                                          hasMore: next.hasMore && !next.items.isEmpty && next.maxTime != maxTime)
+                var cursor = maxTime
+                var added: [DYNotice] = []
+                var more = true
+                for _ in 0..<8 {
+                    let next = try await bridge.notices(group: requestedGroup, maxTime: cursor)
+                    added += next.items.filter { !seen.contains($0.id) && !added.map(\.id).contains($0.id) }
+                    more = next.hasMore && !next.items.isEmpty && next.maxTime != cursor
+                    cursor = next.maxTime
+                    if !added.isEmpty || !more { break }
+                }
+                page = DYCachedNoticePage(items: items + added, maxTime: cursor, hasMore: more)
                 cache.store(page, group: requestedGroup)
+                DYLiveModel.log("DDNOTICE more group=\(requestedGroup) added=\(added.count) more=\(more)")
             }
             guard gen == loadGen, !Task.isCancelled else { return }
             items = page.items
@@ -2248,7 +2541,7 @@ struct DYNoticeListScreen: View {
         }
     }
 
-    private func open(_ n: DYNotice) async {
+    private func open(_ n: DYNotice, reply: Bool = false) async {
         guard isActive else { return }
         let generation = activationGeneration
         if n.type == 33, let a = n.author {
@@ -2266,7 +2559,9 @@ struct DYNoticeListScreen: View {
             let item = try await bridge.awemeDetail(id)
             guard generation == activationGeneration else { return }
             // 评论通知：进视频直接打开评论区并定位到这条评论
-            player = DYMessagePlay(item: item, focus: n.commentFocus)
+            var focus = n.commentFocus
+            focus?.startReply = reply
+            player = DYMessagePlay(item: item, focus: focus)
         } catch {
             self.error = error.localizedDescription
         }
@@ -2722,10 +3017,15 @@ enum DYChatOpener {
       const avatar = e.querySelector('img')?.src || null;
       const id = 's|' + name + '|' + (avatar || '');
       if (seen.has(id)) return;
+      // 对方 sec_uid（React 会话对象上），用来查「关注了你 / 互相关注」
+      const fk = Object.keys(e).find(k => k.startsWith('__reactFiber'));
+      let f = fk ? e[fk] : null, conv = null;
+      for (let i = 0; f && i < 6; i++, f = f.return) if (f.memoizedProps?.conversation) { conv = f.memoizedProps.conversation; break; }
+      const sec = conv?.toParticipantSecUserId || null;
       const b = e.querySelector('[class*="UnReadCount"].semi-badge, [class*="digitsNumber"]');
       const badge = b && b.textContent.trim() ? b.textContent.trim() : (e.querySelector('[class*="UnReadCount"]') ? '•' : '');
       const y = e.getBoundingClientRect().top + (sc ? sc.scrollTop : 0);
-      seen.set(id, { id, name, avatar, preview: txt('[class*="HinttextBox"]'), time: txt('[class*="timeStr"]'), observedAt: Date.now()/1000, badge, index: '0', stranger: true, _y: y, _o: order++ });
+      seen.set(id, { id, name, avatar, preview: txt('[class*="HinttextBox"]'), time: txt('[class*="timeStr"]'), observedAt: Date.now()/1000, badge, index: '0', stranger: true, kind: sec ? 1 : null, sec, _y: y, _o: order++ });
     });
     grab();
     if (sc) {
@@ -2754,6 +3054,8 @@ enum DYChatOpener {
 struct DYStrangerListScreen: View {
     var isActive = true
     var embedded = false
+    /// 同互动页：嵌在信息页右侧时标题让开状态栏
+    var topInset: CGFloat = 0
     var onOpen: ((DYConversationRow) -> Void)? = nil
     var onOpeningChanged: (Bool) -> Void = { _ in }
     @ObservedObject private var cache = DYMessageCache.shared
@@ -2775,6 +3077,8 @@ struct DYStrangerListScreen: View {
                     Divider()
                 }
                 .frame(maxWidth: .infinity)
+                .padding(.top, topInset)
+                .background(Color.ddBackground)
             }
         } else {
             content.navigationTitle(DYMsgRoute.stranger.title).navigationBarTitleDisplayMode(.inline)
@@ -2809,12 +3113,13 @@ struct DYStrangerListScreen: View {
         }
         cache.strangerRows = rows
         cache.strangerUnread = rows.reduce(0) { $0 + (Int($1.badge) ?? ($1.badge.isEmpty ? 0 : 1)) }
+        Task { await cache.resolveFollow(rows.compactMap(\.sec)) }
         if rows.isEmpty { status = "暂无陌生人消息" }
         DYLiveModel.log("DDSTRANGER rows=\(rows.count) unread=\(cache.strangerUnread ?? 0)")
     }
 
     private func line(_ row: DYConversationRow) -> some View {
-        DYConversationCell(row: row)
+        DYConversationCell(row: row, relation: cache.relationLabel(row), followsMe: cache.followsMe(row))
     }
 
     /// 共用同一个网页聊天；嵌入模式由父级保存陌生人列表作为返回目的地。
@@ -2879,6 +3184,7 @@ struct DYForwardScreen: View {
     @State private var showLogin = false
     @State private var showOtherApps = false
     @State private var copiedLink = false
+    @State private var shortLinking = false
     @State private var saving = false
     @State private var saveMessage: String?
 
@@ -2895,6 +3201,7 @@ struct DYForwardScreen: View {
         if !model.contacts.isEmpty { result.append(.init(id: "private", title: "私信好友", symbol: "paperplane.fill")) }
         if model.contacts.contains(where: { $0.kind == 2 }) { result.append(.init(id: "groups", title: "分享至群", symbol: "person.2.fill")) }
         result.append(.init(id: "copy", title: "复制链接", symbol: "link"))
+        if DouyinBridge.primary != nil { result.append(.init(id: "shortlink", title: shortLinking ? "生成中…" : "复制短链", symbol: "link.badge.plus")) }
         if usesClassicLayout { result.append(.init(id: "download", title: saving ? "保存中…" : "下载", symbol: "arrow.down.to.line")) }
         result.append(.init(id: "other", title: "其他分享", symbol: "square.and.arrow.up"))
         if model.loginRequired { result.append(.init(id: "login", title: "登录抖音", symbol: "person.crop.circle")) }
@@ -2913,7 +3220,8 @@ struct DYForwardScreen: View {
                              actions: actions,
                              onContact: selectRecipient,
                              onAction: perform, onClose: { dismiss() },
-                             selectedID: selected?.id, composer: shareComposer)
+                             selectedID: selected?.id, composer: shareComposer,
+                             onMore: model.contacts.isEmpty ? nil : { groupsOnly = false; query = ""; showContacts = true })
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             .background {
                 // Only the system sheet draws glass. Keep the signing/sending
@@ -2936,7 +3244,8 @@ struct DYForwardScreen: View {
                                      status: accountPrepared ? (model.sendIssue ?? (selected != nil && !model.sending ? "" : model.message)) : "正在恢复朋友缓存…", actions: accountPrepared ? actions : [],
                                      onContact: selectRecipient,
                                      onAction: perform, onClose: { dismiss() },
-                                     selectedID: selected?.id, composer: shareComposer)
+                                     selectedID: selected?.id, composer: shareComposer,
+                                     onMore: model.contacts.isEmpty ? nil : { groupsOnly = false; query = ""; showContacts = true })
                     .frame(width: max(0, min(560, geo.size.width - 32)))
                 // 挂载真实官方分享组件，保留React事件与鉴权，但不让网页进入用户界面或无障碍树。
                 if onlineActionsAllowed && accountPrepared && !model.layoutFixture {
@@ -2961,20 +3270,65 @@ struct DYForwardScreen: View {
         }
         .sheet(isPresented: $showContacts) {
             NavigationStack {
-                List(visibleContacts) { contact in
-                    Button {
-                        showContacts = false
-                        selectRecipient(contact)
-                    } label: {
-                        HStack {
+                VStack(spacing: 0) {
+                // 自己画的搜索框（不用 .searchable）：转发面板是全屏层里再弹的表单，后面还挂着隐藏网页，
+                // 系统搜索栏在这里点了不出键盘（老板 11-23）。整条可点，点了直接给输入框焦点。
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass").foregroundStyle(.themeTextSecondary)
+                    // UIKit 输入框：打开就自己要焦点弹键盘（SwiftUI TextField 在这层叠的弹窗里点了没反应，
+                    // 日志里一次焦点变化都没有——老板 11-23 两次反馈）
+                    DYForwardSearchField(text: $query, autoFocus: true)
+                        .frame(maxWidth: .infinity)
+                        .accessibilityIdentifier("douyin.forward.search.field")
+                    if !query.isEmpty {
+                        Button { query = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.themeTextSecondary) }
+                            .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 12).frame(height: 40)
+                .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 10))
+                .contentShape(Rectangle())
+                .onAppear { DYLiveModel.log("DDFWDSEARCH sheet-appear contacts=\(model.contacts.count)") }
+                .padding(.horizontal, 16).padding(.vertical, 8)
+                List {
+                    // 官方同款：搜索框下先给「我的群聊」入口（全部朋友视图、没在搜索时）
+                    if !groupsOnly, query.isEmpty, model.contacts.contains(where: { $0.kind == 2 }) {
+                        Button { groupsOnly = true } label: {
+                            HStack(spacing: 12) {
+                                Image(systemName: "person.2.fill").font(.body)
+                                    .frame(width: 44, height: 44)
+                                    .background(Color(uiColor: .tertiarySystemFill), in: Circle())
+                                Text("我的群聊").foregroundStyle(.themeTextPrimary)
+                                Spacer()
+                                Text("\(model.contacts.filter { $0.kind == 2 }.count)").foregroundStyle(.themeTextSecondary)
+                                Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(.themeTextSecondary)
+                            }
+                        }
+                        .accessibilityIdentifier("douyin.forward.groups")
+                    }
+                    ForEach(visibleContacts) { contact in
+                        HStack(spacing: 12) {
                             CachedAsyncImage(url: contact.avatar.flatMap(URL.init(string:))) { $0.resizable().scaledToFill() }
                                 placeholder: { Image(systemName: contact.kind == 2 ? "person.2.circle" : "person.circle") }
                                 .frame(width: 44, height: 44).clipShape(Circle())
-                            Text(contact.name).foregroundStyle(.themeTextPrimary)
+                            Text(contact.name).foregroundStyle(.themeTextPrimary).lineLimit(1)
+                            Spacer(minLength: 8)
+                            // 点「发送」= 选中这个人回到分享面板（面板里可捎句话再发，走原来那套确认/防重复）
+                            Button("发送") {
+                                showContacts = false
+                                selectRecipient(contact)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(theme.status.danger.color(for: scheme))
+                            .accessibilityIdentifier("douyin.forward.search.send.\(contact.id)")
                         }
                     }
+                    if visibleContacts.isEmpty, !query.isEmpty {
+                        Text("已加载的朋友里没有「\(query)」").font(.footnote).foregroundStyle(.themeTextSecondary)
+                    }
                 }
-                .searchable(text: $query, prompt: "搜索已加载的朋友或群")
+                .listStyle(.plain)
+                }
                 .navigationTitle(groupsOnly ? "选择群聊" : "选择朋友")
                 .toolbar { ToolbarItem(placement: .cancellationAction) { Button("关闭") { showContacts = false } } }
             }
@@ -3022,6 +3376,21 @@ struct DYForwardScreen: View {
         switch action {
         case "private", "groups": groupsOnly = action == "groups"; query = ""; showContacts = true
         case "copy": DYCopyVideoLink.copy(item); saveMessage = nil; copiedLink = true; if !usesClassicLayout { model.message = "链接已复制" }
+        case "shortlink":
+            // 抖音短链（v.douyin.com/xxx/）：接口要页面签名，走主签名页；生成失败就退回长链接
+            guard !shortLinking, let bridge = DouyinBridge.primary else { return }
+            shortLinking = true
+            Task {
+                defer { shortLinking = false }
+                if let s = try? await bridge.shortLink(for: item.webURL) {
+                    UIPasteboard.general.string = DYShareLink.shareText(for: item).replacingOccurrences(of: item.webURL.absoluteString, with: s)
+                    saveMessage = nil; copiedLink = true
+                    if !usesClassicLayout { model.message = "短链已复制" }
+                } else {
+                    saveMessage = "短链生成失败，已改为复制长链接"
+                    DYCopyVideoLink.copy(item)
+                }
+            }
         case "download":
             guard !saving else { return }
             saving = true
@@ -3581,6 +3950,7 @@ private struct DYForwardWebContainer: UIViewRepresentable {
         })()
         """#, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         DYLogoutBlock.install(in: config)
+        DYKeyStateProbe.install(in: config, tag: "forward")
         let web = WKWebView(frame: .zero, configuration: config)
         web.customUserAgent = DouyinWeb.userAgent
         web.navigationDelegate = model; web.uiDelegate = model; model.web = web
@@ -3666,5 +4036,103 @@ struct DYForwardMenu: View {
         let b = builtAt > 0 ? Int((builtAt - tapAt) * 1000) : -1
         DYLiveModel.log("DDMSGOPEN tap→built=\(b)ms tap→appear=\(Int((CACurrentMediaTime() - tapAt) * 1000))ms")
         tapAt = 0
+    }
+}
+
+
+/// 常驻聊天网页里的视频、语音：离开会话或关掉信息页时一律停掉（网页自己放的视频不归原生播放器管）。
+@MainActor enum DYChatMedia {
+    static let pauseJS = "document.querySelectorAll('video,audio').forEach(m=>{try{m.pause()}catch(e){}});true"
+    static func silence(_ web: WKWebView?, reason: String) {
+        guard let web else { return }
+        web.pauseAllMediaPlayback { }
+        web.evaluateJavaScript(pauseJS) { _, _ in }
+        DYLiveModel.log("DDCHATMEDIA pause reason=\(reason)")
+    }
+}
+
+
+/// 当前窗口是否处于分屏（窗口比整块屏幕窄）。只用来决定信息/我的页侧栏放哪边。
+enum DYWindowSplit {
+    @MainActor static var isSplit: Bool {
+        guard let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first(where: { $0.activationState == .foregroundActive })
+                ?? UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first,
+              let window = scene.windows.first(where: \.isKeyWindow) ?? scene.windows.first else { return false }
+        return window.bounds.width < scene.screen.bounds.width - 1
+    }
+}
+
+
+/// 分享「更多」里的搜索框：UIKit UITextField，出现后主动 becomeFirstResponder（弹键盘），点它也一定能编辑。
+/// 每一步都记日志（DDFWDSEARCH），万一还不出键盘能看出卡在哪。
+struct DYForwardSearchField: UIViewRepresentable {
+    @Binding var text: String
+    var autoFocus = false
+
+    func makeCoordinator() -> Coordinator { Coordinator(text: $text) }
+
+    func makeUIView(context: Context) -> UITextField {
+        let f = UITextField()
+        f.placeholder = "搜索"
+        f.borderStyle = .none
+        f.clearButtonMode = .never
+        f.returnKeyType = .search
+        f.autocapitalizationType = .none
+        f.autocorrectionType = .no
+        f.font = .preferredFont(forTextStyle: .body)
+        f.delegate = context.coordinator
+        f.addTarget(context.coordinator, action: #selector(Coordinator.changed(_:)), for: .editingChanged)
+        f.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        f.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        if autoFocus {
+            // 弹窗动画结束后再要焦点，过早要会被系统拒绝
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak f] in
+                guard let f else { return }
+                let ok = f.becomeFirstResponder()
+                DYLiveModel.log("DDFWDSEARCH auto-focus ok=\(ok) window=\(f.window != nil)")
+            }
+        }
+        return f
+    }
+
+    func updateUIView(_ f: UITextField, context: Context) {
+        if f.text != text { f.text = text }
+    }
+
+    /// 页面关掉/点了「发送」：允许收键盘
+    static func dismantleUIView(_ f: UITextField, coordinator: Coordinator) {
+        coordinator.allowEnd = true
+        f.resignFirstResponder()
+    }
+
+    final class Coordinator: NSObject, UITextFieldDelegate {
+        var text: Binding<String>
+        init(text: Binding<String>) { self.text = text }
+        @objc func changed(_ f: UITextField) { text.wrappedValue = f.text ?? "" }
+        /// 只有用户自己收键盘（点键盘上的搜索/回车、点「发送」、关页）才放焦点。
+        /// 真机日志：焦点给上后 1 秒内就被别处抢走、反复如此（后台还挂着官方分享网页、推荐流在刷），键盘根本出不来。
+        var allowEnd = false
+        func textFieldDidBeginEditing(_ f: UITextField) { allowEnd = false; DYLiveModel.log("DDFWDSEARCH begin-editing") }
+        func textFieldShouldEndEditing(_ f: UITextField) -> Bool {
+            if allowEnd || f.window == nil { return true }
+            // 被别处抢焦点：拒绝，并记下是谁想抢
+            DispatchQueue.main.async {
+                let thief = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+                    .flatMap(\.windows).compactMap { $0.dyFirstResponderName }.first ?? "-"
+                DYLiveModel.log("DDFWDSEARCH refused-steal by=\(thief)")
+            }
+            return false
+        }
+        func textFieldDidEndEditing(_ f: UITextField) { DYLiveModel.log("DDFWDSEARCH end-editing") }
+        func textFieldShouldReturn(_ f: UITextField) -> Bool { allowEnd = true; f.resignFirstResponder(); return true }
+    }
+}
+
+private extension UIView {
+    /// 当前第一响应者的类名（排查谁抢了焦点）
+    var dyFirstResponderName: String? {
+        if isFirstResponder { return String(describing: type(of: self)) }
+        for sub in subviews { if let n = sub.dyFirstResponderName { return n } }
+        return nil
     }
 }

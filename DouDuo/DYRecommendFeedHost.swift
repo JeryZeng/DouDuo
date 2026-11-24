@@ -48,6 +48,7 @@ extension DYRecommendFeedHost {
     /// 点**已选中的「推荐」= 刷新推荐**；其它情况交给各界面自己的 `switchTab`（经典有跟手切换动画）。
     /// 滑动切换、程序切换（调试 / 回到推荐）不走这里，不会误刷新。
     func tapChannel(_ target: DYTab, switchTab: (DYTab) -> Void) {
+        DYLiveModel.log("DDTAB tap target=\(target) from=\(tab)")
         if target == .recommend, tab == .recommend {
             DYLiveModel.log("DDREFRESH tap selected recommend")
             #if DEBUG
@@ -343,7 +344,9 @@ extension DYRecommendFeedHost {
         #endif
         guard !refreshing, let i = currentIndex else { return }
         preloader.update(feed.items, current: i, localOnly: feed.offlinePlayback)
-        guard !feed.offlinePlayback else { return }
+        guard !feed.offlinePlayback else { DYFeedLiveWarm.shared.release(reason: "offline"); return }
+        // 下一条是直播：先在后台连上（划到就有画面）
+        DYFeedLiveWarm.shared.update(current: feed.items[i], next: feed.items.indices.contains(i + 1) ? feed.items[i + 1] : nil)
         // 不再预解首帧：界面已不用首帧图顶替（老板要纯黑直出），省 CPU 和解码
         let curID = feed.items[i].id
         let ahead = Array(feed.items.dropFirst(i + 1))
@@ -369,6 +372,24 @@ extension DYRecommendFeedHost {
                     if feed.items.count - j - 1 < want { focusCurrent() }
                 }
             }
+        }
+    }
+
+    /// 推荐列表在当前条之后已经没东西可划（开 App 时拉推荐失败，只剩启动缓存那一条）：补拉一页。
+    /// 以前只有「换条」时才补拉，列表就一条时根本换不了条 → 永远划不动（老板 11-21 真机：拉推荐网络失败后卡在一条上）。
+    /// 由签名就绪和定时器触发；有在拉的、离线模式、刷新中都不动。
+    func refillIfStuck(reason: String) {
+        guard initialized, !refreshing, !feed.offlinePlayback, !feed.loading else { return }
+        let i = currentIndex ?? -1
+        guard feed.items.count - i - 1 < 2, Date().timeIntervalSince(lastFeedPull) > 2 else { return }
+        lastFeedPull = Date()
+        DYLiveModel.log("DDREFILL reason=\(reason) n=\(feed.items.count) at=\(i)")
+        Task {
+            await feed.loadMore(bridge)
+            guard !feed.offlinePlayback else { return }
+            if currentID == nil { currentID = feed.items.first?.id; scrollID = currentID }
+            focusCurrent()
+            DYLiveModel.log("DDREFILL done n=\(feed.items.count)")
         }
     }
 
@@ -400,7 +421,7 @@ extension DYRecommendFeedHost {
 
     func refreshNoticeUnread() async {
         guard let groups = try? await bridge.noticeCounts() else { return }
-        noticeUnread = DYMessagesScreen.badge(groups)
+        noticeUnread = DYMessageCache.shared.maskedBadge(groups)
     }
 
     func reloadRecommendationsAfterLogin() {
@@ -474,7 +495,9 @@ extension DYRecommendFeedHost {
     func reportWatch(old: String?, new: String?) {
         if feed.finishedOfflineID == old { feed.finishedOfflineID = nil }
         if feed.onlineContinuationID == old { feed.onlineContinuationID = nil }
-        guard !feed.offlinePlayback, let new, let item = feed.items.first(where: { $0.id == new }) else { return }
+        guard !feed.offlinePlayback, let new, let item = feed.items.first(where: { $0.id == new }), item.live == nil else { return }
+        // 只要划到就算看过（老板 2026-11-22）：之后推荐再推这条直接跳过
+        DYSeenHistory.shared.mark(new)
         var seen = false
         if let old, let prev = feed.items.first(where: { $0.id == old }), prev.duration > 0,
            DDNowPlaying.id == old { seen = DDNowPlaying.time / prev.duration >= 0.95 }

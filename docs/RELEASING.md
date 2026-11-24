@@ -5,13 +5,16 @@ DouDuo 发版不需要发布管家：负责该版本的维护者（人或 Agent�
 ## 前置
 
 - 主干：`~/Projects/douduo`（`main`），remote `origin` = GitHub `81199000/DouDuo`（公开），`gitee` = Gitee `remon8/douduo`（国内镜像）。
-- `gh` 已登录；Gitee token 在 `~/.hermes/shared-credentials/gitee-remon8.json`（不入库）。
+- `gh` 已登录；Gitee token 文件由 `GITEE_TOKEN_FILE` 指定（默认 `~/.config/douduo/gitee-token.json`，不入库）；装测试机的个人配置写在 `~/.config/douduo/local.env`（见 `scripts/install_duo.sh` 头注释）。
 - 版本号、构建号在 `project.yml`（`MARKETING_VERSION` / `CURRENT_PROJECT_VERSION`），发行说明写 `docs/releases/vX.Y.Z.md`。**发版不改 README**：首页只放功能与安装说明，不写版本号、不列版本流水，版本改动只进 `docs/releases/` 和 Release。
 
 ## 一键发版（推荐）
 
 写好 `docs/releases/vX.Y.Z.md`（第一行 `# 标题` 会作为 Release 标题），在主干 main 上：
 
+scripts/release.sh                   # ★ 一键发版（AI / 自动化直接跑这个）：版本号自动 +1、缺发行说明自动生成、失败重跑即续发
+scripts/release.sh X.Y.Z             # 指定版本号
+scripts/release.sh --dry-run         # 只演练
 ```bash
 scripts/publish.sh X.Y.Z --dry-run   # 先演练：检查 + 编译 + 打包 + 全部测试，不提交不推送
 scripts/publish.sh X.Y.Z             # 正式发版
@@ -31,7 +34,7 @@ scripts/publish.sh X.Y.Z             # 正式发版
    git push gitee main  && git push gitee vX.Y.Z
    ```
 4. **Gitee 发行版**：`python3 scripts/sync_gitee_release.py vX.Y.Z`（建发行版、上传 IPA、匿名下载核对大小，失败会非 0 退出）。
-5. **更新软件源**：`python3 scripts/build_sign_source.py`（读 GitHub 最近 5 个正式版，生成 `docs/source/douduo.json`（国内 Gitee）和 `docs/source/douduo-github.json`）。有「Gitee 缺 vX.Y.Z」提示就回到第 4 步。
+5. **更新软件源**：`python3 scripts/build_sign_source.py`（读 Gitee 最近 5 个正式版，生成 `docs/source/douduo.json`（国内 Gitee）和 `docs/source/douduo-github.json`）。有「Gitee 缺 vX.Y.Z」提示就回到第 4 步。
    ```bash
    git add docs/source && git commit -m "chore(源): 软件源更新到 vX.Y.Z"
    git push origin main && git push gitee main
@@ -43,7 +46,10 @@ scripts/publish.sh X.Y.Z             # 正式发版
 
 ## 软件源说明
 
-- 国内源：`https://gitee.com/remon8/douduo/raw/main/docs/source/douduo.json`（下载走 Gitee）
-- 海外源：`https://raw.githubusercontent.com/81199000/DouDuo/main/docs/source/douduo-github.json`（下载走 GitHub）
+- **官方源（对外首推）**：`https://dl.oneduo.app/douduo/douduo.json`（Cloudflare R2，下载也走 dl.oneduo.app；发版脚本第 8b 步用一键签仓库的 `py/packaging/r2_sync.py` 同步）
+- 备用 · 国内：`https://gitee.com/remon8/douduo/raw/main/docs/source/douduo.json`（下载走 Gitee）
+- 备用 · GitHub：`https://raw.githubusercontent.com/81199000/DouDuo/main/docs/source/douduo-github.json`（下载走 GitHub）
+- 官网 `https://oneduo.app` 是长期固定入口，README、App 内「去下载 / 去一键签更新」都指向它。
+- 版本列表以 Gitee 发行版为准（`build_sign_source.py` 读 Gitee），App 内更新检查也先读 Gitee。
 - 全能签一键添加：`nsk-sign://addsource?url=<源地址>`
 - 源里只放**未签名 IPA**，项目不提供、不出售任何证书。

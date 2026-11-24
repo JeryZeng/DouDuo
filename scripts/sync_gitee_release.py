@@ -2,15 +2,15 @@
 """把 GitHub 上某个正式 Release（默认最新）同步到 Gitee 发行版：建发行版 + 上传 unsigned.ipa。
 
 前置：tag 已推到 gitee（git push gitee main && git push gitee vX.Y.Z）。
-凭据：~/.hermes/shared-credentials/gitee-remon8.json 的 access_token（不入库）。
+凭据：GITEE_TOKEN_FILE（默认 ~/.config/douduo/gitee-token.json）的 access_token（不入库）。
 用法：python3 scripts/sync_gitee_release.py [vX.Y.Z]
 幂等：发行版已存在 / IPA 已挂上就跳过；最后匿名下载核对大小。
 """
-import json, pathlib, subprocess, sys, tempfile, urllib.error, urllib.request, uuid
+import json, os, pathlib, subprocess, sys, tempfile, urllib.error, urllib.request, uuid
 
 GH = "81199000/DouDuo"
 API = "https://gitee.com/api/v5/repos/remon8/douduo"
-TOK = json.loads((pathlib.Path.home() / ".hermes/shared-credentials/gitee-remon8.json").read_text())["access_token"]
+TOK = json.loads(pathlib.Path(os.environ.get("GITEE_TOKEN_FILE", "~/.config/douduo/gitee-token.json")).expanduser().read_text())["access_token"]
 
 
 def gh(*args):
@@ -45,9 +45,12 @@ def main():
         print("发行版已存在", rel["id"])
 
     if ipa["name"] not in [a.get("name") for a in rel.get("assets", [])]:
-        d = pathlib.Path(tempfile.mkdtemp())
-        gh("release", "download", tag, "-R", GH, "-p", ipa["name"], "-D", str(d))
-        data = (d / ipa["name"]).read_bytes()
+        # 本机刚打好的包和 GitHub 上那份大小一致就直接用，省一次下载（家里网络从 GitHub 拉大文件常中途断）
+        # 只用本机刚打好的包上传；不再从 GitHub 下载回来再传（老板 11-21：上传完不该再下载再上传）
+        local = pathlib.Path(__file__).resolve().parent.parent / "build" / ipa["name"]
+        if not (local.exists() and local.stat().st_size == ipa["size"]):
+            sys.exit(f"本机没有 {local}（或大小 ≠ GitHub 上的 {ipa['size']}），请在打包的这台机器上跑")
+        data = local.read_bytes()
         b = uuid.uuid4().hex
         payload = (f"--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{ipa['name']}\"\r\n"
                    f"Content-Type: application/octet-stream\r\n\r\n").encode() + data + f"\r\n--{b}--\r\n".encode()
@@ -57,11 +60,12 @@ def main():
     else:
         print("IPA 已挂上")
 
+    # 只看响应头里的大小，不下载整包（以前把 22MB 完整下一遍来核对）
     url = f"https://gitee.com/remon8/douduo/releases/download/{tag}/{ipa['name']}"
-    out = subprocess.run(["curl", "-sL", "-m", "600", "-o", "/dev/null", "-w", "%{http_code} %{size_download}", url],
+    out = subprocess.run(["curl", "-sIL", "-m", "60", "-o", "/dev/null", "-w", "%{http_code} %header{content-length}", url],
                          capture_output=True, text=True).stdout.split()
-    ok = out and out[0] == "200" and int(out[1]) == ipa["size"]
-    print(("✅" if ok else "❌"), "匿名下载核对", out, "期望大小", ipa["size"])
+    ok = len(out) == 2 and out[0] == "200" and out[1].isdigit() and int(out[1]) == ipa["size"]
+    print(("✅" if ok else "❌"), "匿名地址核对（只读大小）", out, "期望大小", ipa["size"])
     sys.exit(0 if ok else 1)
 
 

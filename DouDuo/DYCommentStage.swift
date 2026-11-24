@@ -52,8 +52,9 @@ struct DYCommentStage<Feed: View, Author: View>: View {
         return ZStack(alignment: .topLeading) {
             feed()
                 .frame(width: layout.videoSize.width, height: layout.videoSize.height, alignment: .topLeading)
-                // 侧栏评论时视频区要裁边：播放器的环境光底（DYAmbientBackdrop）忽略安全区、会铺满整屏宽，
-                // 盖住右侧评论栏（简洁模式内屏评论空白的根因）。
+                .environment(\.dyRestrictsPlaybackToPane, layout.showsPane && layout.sideBySide)
+                // 侧栏评论时视频区要裁边：播放器的环境光底（DYAmbientBackdrop）会铺满整屏宽，盖住右侧评论栏
+                //（内屏横屏评论纯黑的根因；dd405e6 拿掉这个裁边后 11-18 晚复发，老板 11-19 指出之前修过）。
                 .modifier(DDClipIf(on: layout.showsPane && layout.sideBySide))
             if layout.showsPane {
                 Group {
@@ -72,7 +73,7 @@ struct DYCommentStage<Feed: View, Author: View>: View {
                 .padding(.top, !DYDuoMetrics.isDuoHardware && layout.sideBySide ? DYDuoMetrics.windowSafeTop : 0)
                 .frame(width: layout.paneSize.width, height: layout.paneSize.height)
                 .clipped()
-                .dyDeskLight(layout.resident && !layout.sideBySide && !authorOpen)
+                .dyDeskLight(layout.resident && !layout.sideBySide && !authorOpen, videoHeight: layout.videoSize.height)
                 .overlay(alignment: .leading) {
                     if layout.sideBySide { Color(uiColor: .separator).frame(width: 0.5) }
                 }
@@ -124,13 +125,28 @@ extension DYCommentStage where Author == EmptyView {
 extension EnvironmentValues {
     /// 评论打开（默认 / 简洁 / 极简）：视频页上的按钮和信息收起
     @Entry var dyCommentsOpen = false
+    /// 侧栏评论打开时限制画面和环境光的安全区扩展，保持播放器视图身份。
+    @Entry var dyRestrictsPlaybackToPane = false
 }
 
-/// 只在 on 时裁边。
-/// ⚠️ 已知问题（议题 #52-2）：两个分支是两种视图类型，内屏横屏开关评论会重建播放器，进度倒退几秒。
-/// 1.6.1 试过改成常挂 clipShape（关时把裁剪范围放到极大），真机评论区黑屏，已回滚（老板 11-18）——
-/// 别再用超大 clipShape / mask 包视频层。
+/// 侧栏评论时把视频区裁到自己的框内（环境光底铺满整屏会盖住右侧评论栏，dd405e6 拿掉后评论纯黑）。
+///
+/// 裁剪**一直挂着、视图类型不变**：以前写成 `if on { content.clipped() } else { content }`，两个分支是两种视图，
+/// Duo 内屏横屏一开关评论 SwiftUI 就把整块视频连播放器拆掉重建 → 从头播（议题 #52-2 / 工单 B13）。
+/// 关评论时裁剪框只往外放 200pt（盖住安全区就够）。**别放到几万点**：95ef04d 用 ±100000 的超大裁剪，
+/// 真机评论区黑屏（渲染不了那么大的遮罩），已回滚。
 struct DDClipIf: ViewModifier {
     let on: Bool
-    func body(content: Content) -> some View { if on { content.clipped() } else { content } }
+    func body(content: Content) -> some View {
+        content.clipShape(DDPaneClipShape(on: on))
+    }
+}
+
+/// 开评论时只裁左右（别盖住右侧评论栏），上下照样外扩：环境光要铺到屏幕最底边，
+/// 否则底部手势条那一截露出页面底色（老板 11-21：先是白边，垫黑底后成黑边）。
+private struct DDPaneClipShape: Shape {
+    let on: Bool
+    func path(in rect: CGRect) -> Path {
+        Path(rect.insetBy(dx: on ? 0 : -200, dy: -200))
+    }
 }

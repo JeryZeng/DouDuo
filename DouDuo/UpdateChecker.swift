@@ -1,20 +1,27 @@
-// 启动时检查 GitHub 有没有新版本。
-// 不走 api.github.com（匿名 60 次/小时，容易 403），直接读 releases/latest 的 302 跳转，
-// 最终 URL 就是 .../releases/tag/vX.Y.Z，从中取版本号。
+// 启动时检查有没有新版本。
+// 读发行版页 releases/latest 的跳转，最终 URL 就是 .../releases/tag/vX.Y.Z，从中取版本号（不走 API，免限流）。
+// GitHub 仓库 81199000/DouDuo（公开）。更新统一指向自家 oneduo.app：
+// 版本号先读 dl.oneduo.app 上的软件源（Cloudflare R2，发版时同步，不限流），读不到再看 Gitee 的 releases/latest 跳转；
+// 更新方式：打开电脑上的一键签自动装新版（登录态保留）；「去一键签更新」打开 oneduo.app（没装一键签的从这里下载）。
 import Foundation
 import UIKit
 
 struct DDUpdate: Equatable {
     let version: String        // 例如 1.3.1（不带 v）
     let tag: String            // v1.3.1
-    var pageURL: URL { URL(string: "https://github.com/\(DDUpdateChecker.repo)/releases/tag/\(tag)")! }
+    var pageURL: URL { DDUpdateChecker.updatePage }
 }
 
 enum DDUpdateChecker {
     static let repo = "81199000/DouDuo"
+    /// 国内镜像（公开），更新检查和下载页以它为准
+    static let giteeRepo = "remon8/douduo"
     /// 用户点过「关闭 / 去更新」的版本，记下来就不再提示这个版本
     static let dismissedKey = "douduo_dismissed_update_v1"
-    /// 「关于」跳转的开源仓库
+    /// 自家分发：软件源（R2）与更新页
+    static let sourceURL = URL(string: "https://dl.oneduo.app/douduo/douduo.json")!
+    static let updatePage = URL(string: "https://oneduo.app/")!
+    /// 「关于」跳转的开源仓库（GitHub，公开）
     static var repoURL: URL { URL(string: "https://github.com/\(repo)")! }
 
     static var currentVersion: String {
@@ -34,22 +41,49 @@ enum DDUpdateChecker {
             return DDUpdate(version: "9.9.9", tag: "v9.9.9")
         }
         #endif
-        guard let url = URL(string: "https://github.com/\(repo)/releases/latest") else { return nil }
-        var req = URLRequest(url: url, timeoutInterval: 12)
-        req.setValue("DouDuo-iOS", forHTTPHeaderField: "User-Agent")
         let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = 12
         cfg.httpShouldSetCookies = false
         let session = URLSession(configuration: cfg)
-        guard let (_, resp) = try? await session.data(for: req),
-              let http = resp as? HTTPURLResponse,
-              let final = http.url else { return nil }
-        // 跟随后最终地址形如 /releases/tag/v1.3.1；没发过 release 会停在 /releases 或 404
+        // 1. 自家软件源：apps[0].version 就是最新版
+        var src = URLRequest(url: sourceURL, timeoutInterval: 12)
+        src.setValue("DouDuo-iOS", forHTTPHeaderField: "User-Agent")
+        src.cachePolicy = .reloadIgnoringLocalCacheData
+        if let (data, resp) = try? await session.data(for: src),
+           (resp as? HTTPURLResponse)?.statusCode == 200,
+           let update = parseSource(data) {
+            return update
+        }
+        // 2. 兜底：Gitee 发行版 releases/latest 跳转
+        for page in ["https://gitee.com/\(giteeRepo)/releases/latest"] {
+            guard let url = URL(string: page) else { continue }
+            var req = URLRequest(url: url, timeoutInterval: 12)
+            req.setValue("DouDuo-iOS", forHTTPHeaderField: "User-Agent")
+            guard let (_, resp) = try? await session.data(for: req),
+                  let http = resp as? HTTPURLResponse, http.statusCode == 200,
+                  let final = http.url,
+                  let update = parse(final) else { continue }
+            return update
+        }
+        return nil
+    }
+
+    /// 软件源 JSON（全能签格式）→ 最新版本
+    static func parseSource(_ data: Data) -> DDUpdate? {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let apps = obj["apps"] as? [[String: Any]],
+              let ver = apps.first?["version"] as? String,
+              ver.first?.isNumber == true else { return nil }
+        return DDUpdate(version: ver, tag: "v" + ver)
+    }
+
+    /// 跟随跳转后的地址形如 /releases/tag/v1.3.1 → 版本信息；没发过 release 会停在 /releases，返回 nil
+    static func parse(_ final: URL) -> DDUpdate? {
         let comps = final.pathComponents
         guard let idx = comps.firstIndex(of: "tag"), idx + 1 < comps.count else { return nil }
         let tag = comps[idx + 1]
         let ver = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
-        guard !ver.isEmpty else { return nil }
+        guard !ver.isEmpty, ver.first?.isNumber == true else { return nil }
         return DDUpdate(version: ver, tag: tag)
     }
 

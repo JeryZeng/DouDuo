@@ -75,17 +75,64 @@ enum DDAudioSessionGate {
     static func ensureActive() {
         let s = AVAudioSession.sharedInstance()
         if active, s.category == .playback { return }
-        try? s.setCategory(.playback)
+        try? s.setCategory(.playback, options: DYLaunchMute.sessionOptions)
         try? s.setActive(true)
         active = true
     }
+    /// 不看缓存标记，直接再激活一次（便宜）。VLC 停播时会把音频会话关掉（setActive:NO），
+    /// 这里的 active 标记却还是 true → 下一条短视频 play 后一直停着（2026-11-20 真机：
+    /// 推荐里刷过直播卡后，下一条缓冲满了 rate=0 不动）。
+    static func forceActive() {
+        active = false
+        ensureActive()
+    }
     /// 被打断 / 切后台后要重新激活
     static func invalidate() { active = false }
+    /// VLC（推荐里的直播卡）停播是异步的，停完会把整个 App 的音频会话关掉——这时下一条短视频
+    /// 往往已经开播了，会被系统直接暂停（2026-11-20 真机：直播后面那条「开始播放然后卡住」）。
+    /// 直播卡停播后连续几次发这个通知，当前短视频若被意外停住就重新激活会话接着播。
+    static let lostNotification = Notification.Name("DDAudioSessionMaybeLost")
+    private static var lostAt = Date.distantPast
+    /// 直播卡刚停（4 秒内）：这段时间里短视频被停住，基本都是 VLC 关会话导致的
+    static var recentlyLost: Bool { Date().timeIntervalSince(lostAt) < 4 }
+    /// 当前音频输出（扬声器 / 蓝牙耳机 …），排查「直播后滑走卡一下」时对照用
+    static var routeName: String {
+        AVAudioSession.sharedInstance().currentRoute.outputs.map { "\($0.portType.rawValue)" }.joined(separator: "+")
+    }
+    static func noteVLCStopping() {
+        DYLiveModel.log("DDROUTE 直播卡停播 输出=\(routeName)")
+        lostAt = Date()
+        invalidate()
+        for delay in [0.15, 0.3, 0.45, 0.6, 0.8, 1.0, 1.3, 1.6, 2.0, 2.5, 3.0, 3.5] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                invalidate()
+                NotificationCenter.default.post(name: lostNotification, object: nil)
+            }
+        }
+    }
 }
 
 
 import MachO
 /// 内存/播放器数打点：判断「同时暖 N 个播放器」到底吃多少内存
+/// 进程线程数守卫（2026-11-23 卡死：刷 8 小时线程堆到 623 个，后台线程池 512 个上限被占满，主线程等不到回应被系统杀掉）。
+/// 每 30 秒采一次；过了 300 就算「有压力」——收掉预热、不再预热直播，只留正在看的这条。
+enum DYThreadGuard {
+    static let limit = 300
+    nonisolated(unsafe) private(set) static var last = 0
+    static var pressured: Bool { last >= limit }
+    @discardableResult
+    static func sample() -> Int {
+        var list: thread_act_array_t?
+        var n: mach_msg_type_number_t = 0
+        guard task_threads(mach_task_self_, &list, &n) == KERN_SUCCESS, let list else { return last }
+        for i in 0..<Int(n) { mach_port_deallocate(mach_task_self_, list[i]) }
+        vm_deallocate(mach_task_self_, vm_address_t(UInt(bitPattern: list)), vm_size_t(Int(n) * MemoryLayout<thread_act_t>.stride))
+        last = Int(n)
+        return last
+    }
+}
+
 enum DYMemoryProbe {
     static var footprintMB: Double {
         var info = task_vm_info_data_t()

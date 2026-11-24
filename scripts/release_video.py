@@ -100,7 +100,7 @@ SCENES = [
     dict(
         kind="download", eyebrow="下载",
         head=["两个下载地址"],
-        say="下载地址两个：GitHub 搜 81199000 斜杠 DouDuo；国内用 Gitee，remon8 斜杠 douduo。",
+        say="下载地址：官网 oneduo.app；GitHub 搜 81199000 斜杠 DouDuo；国内用 Gitee，remon8 斜杠 douduo。",
     ),
     dict(
         kind="end", eyebrow="DOUDUO", head=["DouDuo 1.3.8"],

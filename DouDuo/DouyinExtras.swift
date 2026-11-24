@@ -70,12 +70,33 @@ struct DYSug: Identifiable, Decodable, Equatable {
     let word: String
 }
 
-enum DYListKind: String, CaseIterable, Identifiable {
-    case post, like, collect, history, later
+/// 「我的 · 收藏」分类，对应网页版 tQ：favorite_folder / video / music / compilation / playlet
+enum DYCollectSub: String, CaseIterable, Identifiable {
+    case folders, video, music, mix, series
     var id: String { rawValue }
     var title: String {
         switch self {
+        case .folders: "我的收藏夹"
+        case .video: "视频"
+        case .music: "音乐"
+        case .mix: "合集"
+        case .series: "短剧"
+        }
+    }
+}
+
+enum DYListKind: String, CaseIterable, Identifiable {
+    // 「私密作品」单独一栏（老板 11-23，网页版同款：作品 / 私密作品 / …，接口 /aweme/v1/web/private/aweme/）
+    case post, secret, like, collect, history, later
+    var id: String { rawValue }
+    /// 网页版「批量管理」在作品 / 私密作品 / 喜欢 / 收藏
+    var supportsBatch: Bool { self == .post || self == .secret || self == .like || self == .collect }
+    /// 作品类（可见范围 / 删除）
+    var isWorks: Bool { self == .post || self == .secret }
+    var title: String {
+        switch self {
         case .post: "作品"
+        case .secret: "私密作品"
         case .like: "喜欢"
         case .collect: "收藏"
         case .history: "历史"
@@ -91,8 +112,8 @@ private struct DYReplyPage: Decodable { let status: Int; let items: [DYComment];
 /// 一次性结束标记（firstWithin 用：结果和超时谁先到算谁）
 @MainActor final class DYOnceFlag { var done = false; init() {} }
 
-private struct DYPublishResp: Decodable { let status: Int; let code: Int?; let msg: String?; let comment: DYComment?; let danmakuID: String?; let diagnostic: String? }
-private struct DYUserResp: Decodable { let status: Int; let user: DYUser?; let msg: String? }
+private struct DYPublishResp: Decodable { let status: Int; let code: Int?; let msg: String?; let comment: DYComment?; let danmakuID: String?; let diagnostic: String?; var verify: String? = nil }
+private struct DYUserResp: Decodable { let status: Int; let user: DYUser?; let msg: String?; var code: Int? = nil }
 private struct DYSugResp: Decodable { let status: Int; let items: [DYSug] }
 
 // MARK: - 接口
@@ -126,8 +147,15 @@ extension DouyinBridge {
     func selfProfile() async throws -> DYUser {
         let d = try await call(Self.selfJS, args: [:])
         let r = try JSONDecoder().decode(DYUserResp.self, from: d)
-        guard let u = r.user, !u.secUid.isEmpty else { throw DYError.bad(r.msg ?? "抖音未登录") }
-        return u
+        if let u = r.user, !u.secUid.isEmpty { return u }
+        // 只有抖音明确回了「未登录」才说未登录（工单 B17）：以前超时 / 断网 / 403 / 风控空包也报「抖音未登录」，
+        // 「我的」据此自动弹登录页、评论恢复页判成登录作废——隔天冷启动网络一慢，用户就以为每天都被退出了
+        if r.status < 0 { throw DYError.bad("读取账号资料超时或网络不通，请稍后重试") }
+        guard r.status == 200 else { throw DYError.blocked("HTTP \(r.status)") }
+        // 真未登录时抖音回 status_code 8 /「用户未登录」；既没错误码也没提示 = 被拦 / 空包，不是未登录
+        if let m = r.msg, !m.isEmpty { throw DYError.bad(m) }
+        if r.code == 8 { throw DYError.bad("抖音未登录") }
+        throw DYError.blocked(r.code.map { "资料接口 code=\($0)" } ?? "资料接口返回为空")
     }
 
     func userProfile(_ sec: String) async throws -> DYUser {
@@ -141,7 +169,17 @@ extension DouyinBridge {
         switch kind {
         case .post:
             let sec = try await selfSecUid()
-            return try await list(Self.postJS, ["sec": sec, "cursor": cursor])
+            // 私密作品在接口里被筛掉后，一页可能空了：接着往后拉（最多 5 页），免得列表以为到底了停在半路
+            var cur = cursor
+            for _ in 0..<5 {
+                let r = try await list(Self.postJS, ["sec": sec, "cursor": cur])
+                if !r.items.isEmpty || !r.hasMore || r.cursor == cur { return r }
+                cur = r.cursor
+            }
+            return try await list(Self.postJS, ["sec": sec, "cursor": cur])
+        case .secret:
+            _ = try await selfSecUid()   // 没登录先报未登录
+            return try await list(Self.privateJS, ["cursor": cursor])
         case .like:
             let sec = try await selfSecUid()
             return try await list(Self.likeJS, ["sec": sec, "cursor": cursor])
@@ -264,6 +302,50 @@ extension DouyinBridge {
 
 
 
+    /// 返回 nil = 网页评论框这一步没把评论发出去（确定没发），可以退回接口方式；
+    /// 只要点过发送且结果不明，就抛「未确认」，绝不再用别的方式补发，免得重复评论。
+    private func publishViaWebUI(_ awemeID: String, text: String, replyID: String?, replyToReplyID: String?, op: String) async throws -> DYComment? {
+        let target = replyToReplyID ?? replyID
+        DYLiveModel.log("DDSEND comment op=\(op) phase=web-ui-submit reply=\(replyID == nil ? 0 : 1)/\(replyToReplyID == nil ? 0 : 1)")
+        let o: DYWebComposer.Outcome
+        do { o = try await DYWebComposer.shared.publish(awemeID: awemeID, text: text, top: replyID, replyTo: target, host: web.superview) }
+        catch {
+            DYLiveModel.log("DDSEND comment op=\(op) phase=web-ui-error")
+            return nil
+        }
+        DYLiveModel.log("DDSEND comment op=\(op) phase=web-ui-\(o.state) stage=\(o.stage ?? "-") status=\(o.status.map(String.init) ?? "nil") code=\(o.code.map(String.init) ?? "nil") diag=\(o.diagnostic ?? "-")")
+        switch o.state {
+        case "sent":
+            if let c = o.comment, Self.isServerCommentID(c.id) { return c }
+            throw DYCommentUnconfirmed(message: "抖音回了成功但没给评论编号；先刷新评论区核对")
+        case "blocked":
+            // 与接口方式一致：403 后服务端常常同时作废登录，交给恢复页核验
+            throw DYLoginExpired()
+        case "rejected":
+            if o.code == 8 { throw DYLoginExpired() }
+            throw DYError.bad(o.msg?.isEmpty == false ? o.msg! : "评论被拒绝（\(o.code ?? -1)），草稿已保留")
+        case "unconfirmed":
+            // 已点发送但回执读不到：和接口方式一样，限时回评论区找自己刚发的这条
+            let identity = try? await selfProfile()
+            if let mine = await Self.firstWithin(Self.reconcileTimeout, { [weak self] in
+                await self?.findMySentComment(awemeID, text: text, replyID: replyID, replyToReplyID: replyToReplyID,
+                                              imageSentAt: Date().timeIntervalSince1970 - 30, identity: identity, hasImage: false)
+            }) {
+                DYLiveModel.log("DDSEND comment op=\(op) phase=web-ui-verified")
+                return mine
+            }
+            DYLiveModel.log("DDSEND comment op=\(op) phase=web-ui-reconcile-miss")
+            throw DYCommentUnconfirmed(message: o.msg ?? "结果未确认，可能已发出；先刷新评论区核对")
+        case "logged-out":
+            throw DYLoginExpired()
+        case "busy":
+            throw DYError.bad("上一条评论还在发送，稍等再发；草稿已保留")
+        default:
+            // not-ready / not-found / compose-error / not-sent：确定没有发出请求
+            return nil
+        }
+    }
+
     func fetchReplies(_ id: String, commentID: String, cursor: Int) async throws -> (items: [DYComment], cursor: Int, hasMore: Bool) {
         let d = try await call(Self.replyJS, args: ["id": id, "cid": commentID, "cursor": String(cursor)], attempts: 1)
         let p = try JSONDecoder().decode(DYReplyPage.self, from: d)
@@ -281,23 +363,56 @@ extension DouyinBridge {
                                    "imgH": String(image?.height ?? 0), "imgFmt": image?.format ?? ""]
         let operationID = UUID().uuidString
         DYLiveModel.log("DDSEND comment op=\(operationID) phase=prepare")
+        // 纯文字（含回复/楼中楼）走「真人方式」：抖音网页自己的评论框 + 发送按钮。带图仍走接口。
+        if image == nil, DYWebComposer.enabled {
+            if let c = try await publishViaWebUI(awemeID, text: text, replyID: replyID, replyToReplyID: replyToReplyID, op: operationID) {
+                return c
+            }
+            DYLiveModel.log("DDSEND comment op=\(operationID) phase=web-ui-fallback")
+        }
         guard await ensureWriteReady() else {
             DYLiveModel.log("DDSEND comment op=\(operationID) phase=not-ready")
             throw DYError.bad("评论签名页尚未就绪，未发送；草稿已保留")
         }
         // 在写入前获取本次身份；无法获取时可发一次，但不能把列表里的其他评论当作确认。
         let identity = try? await selfProfile()
+        do {
+            return try await publishViaAPI(awemeID, text: text, replyID: replyID, replyToReplyID: replyToReplyID,
+                                           image: image, args: args, identity: identity, operationID: operationID, phase: "submit")
+        } catch let v as DYCommentNeedsVerify {
+            // 官方网页版同款：抖音要求身份验证 → 弹官方验证 → 通过后把同一条再发一次（只一次，不循环）
+            DYLiveModel.log("DDSEND comment op=\(operationID) phase=verify-required")
+            switch await DYPassportVerify.run(decision: v.decision) {
+            case .passed:
+                do {
+                    return try await publishViaAPI(awemeID, text: text, replyID: replyID, replyToReplyID: replyToReplyID,
+                                                   image: image, args: args, identity: identity, operationID: operationID, phase: "resubmit")
+                } catch is DYCommentNeedsVerify {
+                    DYLiveModel.log("DDSEND comment op=\(operationID) phase=verify-again")
+                    throw DYError.bad("验证通过了，但抖音仍要求验证，这条没发出去；草稿已保留，稍后再试")
+                }
+            case .cancelled:
+                throw DYError.bad("已取消身份验证，这条没发出去；草稿已保留")
+            case .failed(let why):
+                throw DYError.bad("身份验证没完成（\(why)），这条没发出去；草稿已保留")
+            }
+        }
+    }
+
+    /// 接口方式发一次。抖音要求身份验证且确认没收下时抛 DYCommentNeedsVerify（由上层弹验证后重发一次）。
+    private func publishViaAPI(_ awemeID: String, text: String, replyID: String?, replyToReplyID: String?, image: DYImageXUploadResult?,
+                               args: [String: Any], identity: DYUser?, operationID: String, phase: String) async throws -> DYComment {
         let sentAt = Date().timeIntervalSince1970
-        DYLiveModel.log("DDSEND comment op=\(operationID) phase=submit")
+        DYLiveModel.log("DDSEND comment op=\(operationID) phase=\(phase)")
         let d: Data
         do { d = try await call(Self.publishJS, args: args, attempts: 1) }
         catch {
             DYLiveModel.log("DDSEND comment op=\(operationID) phase=transport-unknown")
-            throw DYError.bad("评论结果未确认，草稿已保留；请先查看评论，勿连续重发")
+            throw DYCommentUnconfirmed(message: "结果未确认，可能已发出；先刷新评论区核对")
         }
         guard let r = try? JSONDecoder().decode(DYPublishResp.self, from: d) else {
             DYLiveModel.log("DDSEND comment op=\(operationID) phase=decode-unknown")
-            throw DYError.bad("评论回执无法识别，草稿已保留；请先查看评论，勿连续重发")
+            throw DYCommentUnconfirmed(message: "回执无法识别，可能已发出；先刷新评论区核对")
         }
         // 服务端文案、正文、账号标识与响应全文不入日志。
         DYLiveModel.log("DDSEND comment op=\(operationID) phase=response status=\(r.status) code=\(r.code.map(String.init) ?? "nil") diag=\(r.diagnostic ?? "-")")
@@ -331,13 +446,18 @@ extension DouyinBridge {
             return mine
         }
         let waited = Int(Date().timeIntervalSince(started) * 1000)
+        // 空回执 + 要求身份验证，且回查确认评论区里没有这条：确定没收下，交给上层弹验证
+        if let decision = r.verify, !decision.isEmpty, r.comment == nil {
+            DYLiveModel.log("DDSEND comment op=\(operationID) phase=needs-verify waitedMs=\(waited)")
+            throw DYCommentNeedsVerify(decision: decision)
+        }
         // 403 空响应：签名完整仍被拒，属于抖音对这次写入的拦截（常伴随验证要求），引导去网页版处理，不自动重发
         if r.status == 403 {
             DYLiveModel.log("DDSEND comment op=\(operationID) phase=blocked-403 waitedMs=\(waited)")
             throw DYLoginExpired()
         }
         DYLiveModel.log("DDSEND comment op=\(operationID) phase=unknown waitedMs=\(waited)")
-        throw DYError.bad("评论结果未确认，草稿已保留；请先查看对应评论或回复，勿连续重发")
+        throw DYCommentUnconfirmed(message: "结果未确认，可能已发出；先刷新评论区核对")
     }
 
     /// 发送后回查的总时限（秒）。超时按「结果未知」处理，不当成功、不重发。
@@ -393,6 +513,21 @@ extension DouyinBridge {
             return actualParent == parent && actualTarget == target
         }
         return matches.count == 1 ? matches.first : nil
+    }
+
+    /// 发完回复后核对：在那条一级评论的回复里翻前 3 页找这条 id。nil = 读不到，核对不了。
+    func replyIsVisible(_ awemeID: String, thread: String, id: String) async -> Bool? {
+        var cursor = 0
+        for attempt in 0..<2 {
+            if attempt > 0 { try? await Task.sleep(for: .seconds(2)); cursor = 0 }
+            for _ in 0..<3 {
+                guard let page = try? await fetchReplies(awemeID, commentID: thread, cursor: cursor) else { return nil }
+                if page.items.contains(where: { $0.id == id }) { return true }
+                guard page.hasMore, !page.items.isEmpty else { break }
+                cursor = page.cursor
+            }
+        }
+        return false
     }
 
     /// 删除评论（自己发的，或自己作品下的）。只在用户确认之后调用，不重试。
@@ -462,13 +597,24 @@ extension DouyinBridge {
     const hooked = (f) => { try { return !/native code/.test(f().toString()); } catch (e) { return 'na'; } };
     const diagnostic = 'kind=' + kind + ' chars=' + raw.length + ' keys=' + keys + ' ident=' + (haveIdent || 'none')
       + ' sdk=' + sdk + ' signed=' + signed + ' img=' + hasImage + ' imgBack=' + ((d.comment && d.comment.image_list) || []).length
+      // 只记 id：请求挂在哪条下面、抖音实际挂到哪条下面、评论状态（判断「发出了却看不到」）
+      + ' req=' + (typeof reply === 'string' && reply ? reply : '0') + '/' + (typeof replyTo === 'string' && replyTo ? replyTo : '0')
+      + ' got=' + (d.comment ? String(d.comment.reply_id ?? '-') + '/' + String(d.comment.reply_to_reply_id ?? '-') + ' st=' + String(d.comment.status ?? '-') : '-')
+      // 只记验证相关响应头「有没有」，不记值（官方网页版靠它们弹滑块/短信验证后重发）
+      + (() => { const h = String(r.h || '').toLowerCase(); const f = n => h.includes('\n' + n + ':') ? 1 : 0;
+          return ' vp=' + f('x-tt-verify-passport-decision') + ' bt=' + f('bdturing-verify') + ' vc=' + f('x-vc-bdturing-parameters')
+            + ' tg=' + f('bd-ticket-guard-result') + ' shark=' + ((d.data && d.data.shark_decision_conf) ? 1 : 0)
+            + ' tgr=' + (() => { const m = h.match(/\nbd-ticket-guard-result:\s*([^\r\n]*)/); if (!m) return '-'; const v = m[1].trim(); return /^-?\d{1,6}$/.test(v) ? v : 'x'; })(); })()
       + ' xhrHooked=' + hooked(() => XMLHttpRequest.prototype.send)
       + ' fetchHooked=' + hooked(() => window.fetch);
     const fallback = kind === 'empty' ? '抖音返回空响应，未能确认评论是否发送，请勿连续重发'
       : kind === 'html' ? '抖音返回了网页而非评论结果，请在网页版查看是否有验证提示'
       : '未收到有效的评论确认结果，请勿连续重发';
     const msg = d.status_msg || ((!d.comment || d.status_code !== 0 || r.s !== 200) ? fallback : null);
-    return JSON.stringify({ status: r.s, code: d.status_code ?? null, msg, comment: cmap(d.comment), danmakuID: null, diagnostic });
+    // 抖音要求身份验证时把头的原值交回 App（只在内存里转给官方验证组件，不进日志）
+    const vm = String(r.h || '').match(/\nx-tt-verify-passport-decision:\s*([^\r\n]*)/i);
+    const verify = !d.comment && vm && vm[1].trim() ? vm[1].trim() : null;
+    return JSON.stringify({ status: r.s, code: d.status_code ?? null, msg, comment: cmap(d.comment), danmakuID: null, diagnostic, verify });
     """#
 
     static let deleteCommentJS = #"""
@@ -515,7 +661,7 @@ extension DouyinBridge {
     static let selfJS = userMap + #"""
     const r = await req('GET', '/aweme/v1/web/user/profile/self/?' + q({ publish_video_strategy_type: '2', source: 'channel_pc_web', personal_center_strategy: '1' }));
     const d = parse(r.t) || {};
-    return JSON.stringify({ status: r.s, user: umap(d.user), msg: d.status_msg || null });
+    return JSON.stringify({ status: r.s, user: umap(d.user), msg: d.status_msg || null, code: typeof d.status_code === 'number' ? d.status_code : null });
     """#
 
     static let otherJS = userMap + #"""
@@ -525,9 +671,20 @@ extension DouyinBridge {
     """#
 
     static let postJS = listTail + #"""
-    const r = await req('GET', '/aweme/v1/web/aweme/post/?' + q({ sec_user_id: sec, max_cursor: cursor, locate_query: 'false', show_live_replay_strategy: '1', need_time_list: '1', time_list_query: '0', whale_cut_token: '', cut_version: '1', count: '18' }));
+    const r = await req('GET', '/aweme/v1/web/aweme/post/?' + qPost({ sec_user_id: sec, max_cursor: cursor, locate_query: 'false', show_live_replay_strategy: '1', need_time_list: '1', time_list_query: '0', whale_cut_token: '', cut_version: '1', count: '18' }));
     const d = parse(r.t) || {};
     // 自己的作品：origin_cover 是全黑占位图（2026-11-16 实测 360×721 全 0），改用 cover
+    (d.aweme_list || []).forEach(a => { if (a) a.__ddSelfList = true; });
+    // 私密作品单独在「私密作品」栏，这里不再混着显示（老板 11-23）。
+    // status.private_status：0 公开 / 1 私密 / 2 好友可见（网页版枚举）；好友可见仍留在「作品」
+    const list = (d.aweme_list || []).filter(a => !(a && a.status && Number(a.status.private_status) === 1));
+    return pack(r, d, list, d.max_cursor, d.has_more);
+    """#
+
+    /// 私密作品（网页版「私密作品」栏同一接口；只有自己能看）
+    static let privateJS = listTail + #"""
+    const r = await req('GET', '/aweme/v1/web/private/aweme/?' + qPost({ max_cursor: cursor, min_cursor: '0', count: '18' }));
+    const d = parse(r.t) || {};
     (d.aweme_list || []).forEach(a => { if (a) a.__ddSelfList = true; });
     return pack(r, d, d.aweme_list, d.max_cursor, d.has_more);
     """#
@@ -666,6 +823,29 @@ extension DouyinBridge {
 @MainActor enum DDNowPlaying {
     static var id = ""
     static var time: Double = 0
+    /// 正在写进度的播放器实例；滑走 / 页面消失时清空并记下时刻
+    private static var owner: UUID?
+    private static var releasedAt = Date.distantPast
+
+    static func note(_ id: String, _ time: Double, owner: UUID) {
+        self.id = id; self.time = time; self.owner = owner
+    }
+
+    /// whilePlaying = 当前页还在前台就被拆掉（视图重建）；滑走只清空，不算可接手
+    static func release(_ owner: UUID, whilePlaying: Bool) {
+        guard self.owner == owner else { return }
+        self.owner = nil
+        if whilePlaying { releasedAt = Date() }
+    }
+
+    /// 同一条视频的播放器被 SwiftUI 重建（内屏开关侧栏评论时 DDClipIf 换视图身份，#52-2 / 工单 B13）：
+    /// 新实例建好时外层的 resume 还是旧值（旧实例 onDisappear 才回写），直接接旧实例的实时进度，否则从头播。
+    static func handoff(_ id: String, to instance: UUID) -> Double? {
+        guard self.id == id, time.isFinite, time > 0 else { return nil }
+        let liveElsewhere = owner != nil && owner != instance
+        guard liveElsewhere || Date().timeIntervalSince(releasedAt) < 1.5 else { return nil }
+        return time
+    }
 }
 
 // MARK: - 弹幕调度策略
@@ -900,6 +1080,14 @@ enum DYSaver {
 
 // MARK: - 封面网格（搜索 / 我的 / 作者）
 
+/// 只有传了刷新动作才挂 .refreshable：作者页等没有刷新的列表不出现下拉转圈
+private struct DYOptionalRefresh: ViewModifier {
+    let action: (() async -> Void)?
+    func body(content: Content) -> some View {
+        if let action { content.refreshable { await action() } } else { content }
+    }
+}
+
 struct DYGrid: View {
     let items: [DYAweme]
     let hasMore: Bool
@@ -911,14 +1099,39 @@ struct DYGrid: View {
     /// 长按格子出的移除项（例如「移出稍后再看」）。两个都给了才有长按菜单。
     var removeTitle: String? = nil
     var onRemove: ((DYAweme) -> Void)? = nil
+    /// 作者主页：刚刚看过的那条（同抖音：格子上标「刚刚看过」，不在屏上时底部给一键定位）
+    var focusID: String? = nil
+    /// 传了就支持下拉刷新（系统下拉转圈，等它返回才收起）
+    var onRefresh: (() async -> Void)? = nil
+    /// 批量管理：非 nil 时进入多选，点格子切换勾选，不再打开播放
+    var selection: Binding<Set<String>>? = nil
     private let cols = [GridItem(.adaptive(minimum: 140), spacing: 2)]
+    @State private var focusVisible = false
 
     @ViewBuilder
     private func gridButton(_ i: Int, _ a: DYAweme) -> some View {
-        let button = Button { onOpen(i) } label: { cell(a) }
+        let button = Button {
+            if let selection {
+                if selection.wrappedValue.contains(a.id) { selection.wrappedValue.remove(a.id) } else { selection.wrappedValue.insert(a.id) }
+            } else { onOpen(i) }
+        } label: {
+            cell(a).overlay(alignment: .topLeading) {
+                if let selection {
+                    let on = selection.wrappedValue.contains(a.id)
+                    Image(systemName: on ? "checkmark.circle.fill" : "circle")
+                        .font(.title3).symbolRenderingMode(.palette)
+                        .foregroundStyle(.white, on ? Color.pink : Color.black.opacity(0.35))
+                        .padding(6)
+                        .accessibilityIdentifier(on ? "douyin.grid.selected" : "douyin.grid.unselected")
+                }
+            }
+        }
             .buttonStyle(.plain)
             .accessibilityIdentifier("douyin.grid.item.\(a.id)")
-        if let onRemove, let removeTitle {
+            .id(a.id)
+            .onAppear { if a.id == focusID { focusVisible = true } }
+            .onDisappear { if a.id == focusID { focusVisible = false } }
+        if selection == nil, let onRemove, let removeTitle {
             button.contextMenu {
                 Button(removeTitle, systemImage: "minus.circle", role: .destructive) { onRemove(a) }
                     .accessibilityIdentifier("douyin.grid.remove")
@@ -932,6 +1145,7 @@ struct DYGrid: View {
         // 底部哨兵只在真正滚进可视区时才翻页：ScrollView 的非惰性子视图会立刻 onAppear，
         // 直接 onAppear 会一页接一页把作者作品全拉下来（2026-11-07 实测）。
         GeometryReader { outer in
+          ScrollViewReader { proxy in
             ScrollView {
                 LazyVGrid(columns: cols, spacing: 2) {
                     ForEach(Array(items.enumerated()), id: \.element.id) { i, a in
@@ -956,9 +1170,29 @@ struct DYGrid: View {
                 }
             }
             .coordinateSpace(name: "ddgrid")
+            .modifier(DYOptionalRefresh(action: onRefresh))
             .onPreferenceChange(DYBottomYKey.self) { y in
                 if y < outer.size.height - 16 { onLoadMore() }
             }
+            .overlay(alignment: .bottom) {
+                if let focusID, !focusVisible, items.contains(where: { $0.id == focusID }) {
+                    Button {
+                        withAnimation(.snappy) { proxy.scrollTo(focusID, anchor: .center) }
+                        DYLiveModel.log("DDAUTHOR jump-to-recent id=\(focusID)")
+                    } label: {
+                        Label("定位到刚刚看过", systemImage: "scope")
+                            .font(.footnote.weight(.semibold))
+                            .padding(.horizontal, 16).padding(.vertical, 10)
+                    }
+                    .buttonStyle(.plain)
+                    .glassEffect(.regular.interactive(), in: .capsule)
+                    .padding(.bottom, 20)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .accessibilityIdentifier("douyin.author.jumpRecent")
+                }
+            }
+            .animation(.snappy, value: focusVisible)
+          }
         }
     }
 
@@ -970,6 +1204,22 @@ struct DYGrid: View {
                     placeholder: { Color.white.opacity(0.06) }
             }
             .clipped()
+            .overlay {
+                if a.id == focusID {
+                    Rectangle().strokeBorder(Color.white.opacity(0.9), lineWidth: 2)
+                }
+            }
+            .overlay(alignment: .topLeading) {
+                if a.id == focusID {
+                    Text("刚刚看过")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 6).padding(.vertical, 3)
+                        .background(Color.black.opacity(0.6), in: .rect(cornerRadius: 4))
+                        .padding(5)
+                        .accessibilityIdentifier("douyin.grid.recent")
+                }
+            }
             .overlay(alignment: .topTrailing) {
                 if !a.images.isEmpty {
                     Image(systemName: "photo.on.rectangle").font(.caption).foregroundStyle(.white).padding(6)
@@ -1071,8 +1321,8 @@ struct DYListPlayer: View {
     let commentFocus: DYCommentFocus?
     /// 信息里点开的分享视频：关掉时彻底收掉声音（播放器、音频引擎、音频会话）
     let hardStopOnDismiss: Bool
-    /// 打开期间把外层（首页/信息页底下的）播放压住；关掉时成对释放
-    @State private var coverHeld = false
+    /// 打开时外面已经盖了几层遮罩（信息页 / 我的）：这个播放器就在那一层之上，可以照常播
+    @State private var coverLevel = DDPlayback.shared.coverDepth
     /// 点头像时作者页由播放器自己弹在上面。播放器是全屏页：交给底下的页面弹，会被播放器盖住，
     /// 要返回关掉播放器后才看到（老板 11-16 报：搜索出来的视频点头像不跳，返回才跳）
     let presentsAuthor: Bool
@@ -1148,6 +1398,7 @@ struct DYListPlayer: View {
         .environment(\.duoSystemBars, true)
         .environment(\.duoCleanScreen, false)
         .environment(\.duoInlineVideoNavigation, false)
+        .environment(\.ddCoverLevel, offlineLibrary ? 0 : coverLevel)
         .onReceive(DYOfflineDownloads.shared.$isOffline.removeDuplicates()) { offline in
             guard offlineLibrary else { return }
             networkIsOffline = offline
@@ -1199,6 +1450,7 @@ struct DYListPlayer: View {
                 .onAppear { DDPlayback.shared.pauseAll(reason: .cover) }   // 设置页也停掉视频
         }
         .fullScreenCover(item: $web) { t in DouyinWebScreen(start: t.url) }
+        .modifier(DYCollectPromptHost(owner: .list))
         .sheet(item: $authorSheet, onDismiss: { if !offlineLibrary { DDPlayback.shared.releaseCover() } }) { a in
             NavigationStack {
                 DYAuthorScreen(bridge: bridge, author: a, onWeb: { url in
@@ -1214,7 +1466,7 @@ struct DYListPlayer: View {
         @Bindable var playback = playback
         if offlineLibrary {
             DYFeedPager(items: playback.items, currentID: $playback.currentID, scrollID: $scrollPos,
-                        userScrolling: $userScrolling, scrollEndTask: $scrollEndTask) { item in
+                        userScrolling: $userScrolling, scrollEndTask: $scrollEndTask) { item, _ in
                 page(item, insets: insets)
             }
             .accessibilityElement(children: .contain)
@@ -1342,7 +1594,10 @@ struct DYListPlayer: View {
         if want { playback.collected.insert(id) } else { playback.collected.remove(id) }
         Task {
             let r = try? await bridge.favorite(id, add: want)
-            if case .ok = r { show(want ? "已收藏" : "已取消收藏"); return }
+            if case .ok = r {
+                if want { DYCollectPrompt.shared.show(id, owner: .list) } else { show("已取消收藏") }
+                return
+            }
             if want { playback.collected.remove(id) } else { playback.collected.insert(id) }
             show("收藏失败")
         }
@@ -1365,6 +1620,23 @@ final class DYPagedModel: ObservableObject {
     }
 
     func reset() { items = []; cursor = "0"; hasMore = true; error = nil }
+
+    /// 下拉刷新：重新拉第一页。拉到了才替换（旧内容先留着，失败也不清空页面）
+    func refresh() async {
+        while loading { try? await Task.sleep(for: .milliseconds(100)) }
+        loading = true
+        defer { loading = false }
+        do {
+            let r = try await fetch("0")
+            items = r.items.filter { $0.play != nil || !$0.images.isEmpty }
+            hasMore = r.hasMore && !r.items.isEmpty && r.cursor != "0"
+            cursor = r.cursor
+            error = nil
+        } catch {
+            if items.isEmpty { self.error = error.localizedDescription }
+            DYLiveModel.log("DDMINE refresh err " + error.localizedDescription)
+        }
+    }
 
     @discardableResult
     func loadMore() async -> [DYAweme] {
@@ -1660,10 +1932,15 @@ struct DYMineScreen: View {
     var onMessages: (() -> Void)? = nil
     /// 嵌在信息页里（跟信息共用右侧栏）：不画自己的返回键、不做左缘返回
     var embedded = false
-    @State private var user: DYUser?
+    /// 内存缓存：「我的」被重建（切 Tab / 经典模式底栏切换）时直接用上次的资料和列表，先出画面再后台刷新。
+    /// 换账号时清空（accountChanged）。
+    @MainActor static var cachedUser: DYUser?
+    @MainActor static var cachedModels: [DYListKind: DYPagedModel] = [:]
+    @MainActor static var cachedKind: DYListKind = .post
+    @State private var user: DYUser? = DYMineScreen.cachedUser
     @State private var userErr: String?
-    @State private var kind: DYListKind = .post
-    @State private var models: [DYListKind: DYPagedModel] = [:]
+    @State private var kind: DYListKind = DYMineScreen.cachedKind
+    @State private var models: [DYListKind: DYPagedModel] = DYMineScreen.cachedModels
     @State private var open: DYListTarget?
     @State private var relations: DYRelationsTarget?
     @State private var manageMsg: String?
@@ -1672,6 +1949,16 @@ struct DYMineScreen: View {
     /// App 内登录页（DYAppLoginScreen）；检测到未登录时进「我的」先弹它（老板 2026-11-17）
     @State private var showLogin = false
     @State private var showAccounts = false
+    /// 发布作品：开抖音创作者中心的上传页（DYUploadScreen），关掉后刷新作品列表
+    @State private var showUpload = false
+    /// 批量管理（作品 / 喜欢 / 收藏）：多选后删除、改可见范围、取消喜欢 / 收藏、放进收藏夹
+    @State private var managing = false
+    @State private var picked: Set<String> = []
+    @State private var batchBusy = false
+    @State private var confirmBatch: DYMineBatch?
+    @State private var moveTarget: [String]?
+    /// 「收藏」下的分类（网页版同款：收藏夹 / 视频 / 音乐 / 合集 / 短剧）
+    @State private var collectSub: DYCollectSub = .video
     /// 这次打开期间已经自动弹过登录：放在静态里——简洁 / 极简模式在信息 ⇄ 我的之间切换会重建「我的」，
     /// @State 会被重置，导致每切回来一次就再弹一次登录
     private static var autoLoginShownAt: Date?
@@ -1720,6 +2007,7 @@ struct DYMineScreen: View {
     /// 切换 / 退出 / 添加账号后：签名页重载，清空当前页面数据，重新读资料
     private func accountChanged(showLoginAfter: Bool = false) async {
         user = nil; userErr = nil; models = [:]
+        Self.cachedUser = nil; Self.cachedModels = [:]
         bridge.reload()
         onLogin()   // 外层刷新推荐流
         try? await Task.sleep(for: .seconds(2))
@@ -1739,15 +2027,21 @@ struct DYMineScreen: View {
             return
         }
         #endif
+        let previous = user
         do {
             let u = try await bridge.selfProfile()
             user = u; userErr = nil
+            Self.cachedUser = u
             await DYAccountStore.shared.remember(u)   // 登录过的账号存起来，之后可直接切换
         } catch {
-            userErr = error.localizedDescription
+            // 有缓存资料时网络抖一下不顶掉页面
+            if user == nil { userErr = error.localizedDescription }
             DYLiveModel.log("DDMINE self err " + error.localizedDescription)
         }
-        if user != nil { models = [:]; ensure(kind) }
+        // 同一账号再进来：列表沿用缓存（不清空、不重拉），只有换了账号才重建
+        if let u = user, previous?.secUid != u.secUid || models.isEmpty {
+            models = [:]; Self.cachedModels = [:]; ensure(kind)
+        }
     }
 
     private var content: some View {
@@ -1763,6 +2057,17 @@ struct DYMineScreen: View {
                 .accessibilityIdentifier("douyin.mine.title")
             }
             header.padding(.horizontal, 16).padding(.bottom, 12)
+            if user != nil {
+                Button { showUpload = true } label: {
+                    Label("发布作品", systemImage: "plus.circle.fill")
+                        .font(.subheadline.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .tint(.pink)
+                .padding(.horizontal, 16).padding(.bottom, 10)
+                .accessibilityIdentifier("douyin.mine.upload")
+            }
 
             HStack(spacing: 22) {
                 ForEach(DYListKind.allCases) { k in
@@ -1779,12 +2084,42 @@ struct DYMineScreen: View {
             }
             .padding(.bottom, 6)
 
-            if kind == .history || manageMsg != nil {
+            if kind == .collect && !managing {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(DYCollectSub.allCases) { c in
+                            Button { collectSub = c } label: {
+                                Text(c.title).font(.caption.weight(collectSub == c ? .semibold : .regular))
+                                    .padding(.horizontal, 12).padding(.vertical, 6)
+                                    .background(Capsule().fill(Color.primary.opacity(collectSub == c ? 0.16 : 0.06)))
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityIdentifier("douyin.mine.collect.\(c.rawValue)")
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                }
+                .padding(.bottom, 6)
+            }
+
+            if (kind.supportsBatch && !(kind == .collect && collectSub != .video)) || kind == .history || manageMsg != nil {
                 HStack(spacing: 10) {
                     if let manageMsg {
                         Text(manageMsg).font(.caption).foregroundStyle(.orange).lineLimit(2)
                     }
                     Spacer(minLength: 0)
+                    if kind.supportsBatch && !(kind == .collect && collectSub != .video) {
+                        if managing {
+                            Text("已选 \(picked.count)").font(.caption).foregroundStyle(.secondary)
+                            Button("全选") { picked = Set(models[kind]?.items.map(\.id) ?? []) }
+                                .font(.caption).accessibilityIdentifier("douyin.mine.batch.all")
+                            Button("完成") { managing = false; picked = [] }
+                                .font(.caption.weight(.semibold)).accessibilityIdentifier("douyin.mine.batch.done")
+                        } else {
+                            Button("管理", systemImage: "checklist") { managing = true; picked = []; manageMsg = nil }
+                                .font(.caption).accessibilityIdentifier("douyin.mine.batch")
+                        }
+                    }
                     if kind == .history {
                         Button(clearingHistory ? "清空中…" : "清空历史", systemImage: "trash") { confirmClearHistory = true }
                             .font(.caption)
@@ -1795,13 +2130,30 @@ struct DYMineScreen: View {
                 .padding(.horizontal, 16).padding(.bottom, 6)
             }
 
-            if let m = models[kind] {
-                DYMineList(model: m, showsPlayCount: kind == .post,
+            if kind == .collect && collectSub != .video {
+                Group {
+                    switch collectSub {
+                    case .folders: DYCollectsFoldersScreen(bridge: bridge, onAuthor: onAuthor, embedded: true)
+                    case .music: DYCollectedMusicScreen(bridge: bridge, embedded: true)
+                    case .mix: DYCollectedMixesScreen(bridge: bridge, onAuthor: onAuthor, embedded: true)
+                    case .series: DYCollectedMixesScreen(bridge: bridge, onAuthor: onAuthor, series: true, embedded: true)
+                    case .video: EmptyView()
+                    }
+                }
+                .id(collectSub)
+                .scrollContentBackground(.hidden)
+            } else if let m = models[kind] {
+                DYMineList(model: m, showsPlayCount: kind.isWorks,
                            removeTitle: kind == .later ? "移出稍后再看" : nil,
-                           onRemove: kind == .later ? { a in Task { await removeLater(a, from: m) } } : nil) { i in
+                           onRemove: kind == .later ? { a in Task { await removeLater(a, from: m) } } : nil,
+                           onRefresh: { await pullRefresh(m) },
+                           selection: managing && kind.supportsBatch ? $picked : nil) { i in
                     open = DYListTarget(title: kind.title, items: m.items, start: i, model: m)
                 }
                 .id(kind)
+                .safeAreaInset(edge: .bottom, spacing: 0) {
+                    if managing && kind.supportsBatch { batchBar(m) }
+                }
             }
         }
         .background(alignment: .top) {
@@ -1818,9 +2170,15 @@ struct DYMineScreen: View {
                 return
             }
             #endif
+            DYLiveModel.log("DDMINE appear cachedUser=\(user != nil) lists=\(models.count)")
             // 未登录：进「我的」先弹登录。看共享 cookie 有没有 sessionid，不等资料接口——
             // 真机上签名页没加载好时接口报的是「页面还没加载好 / 被拦截」，不是「未登录」，以前因此不弹（老板 11-17）
-            if !autoLoginShown, !(await DYLoginState.hasSession()) {
+            #if DEBUG
+            let selfFixture = ProcessInfo.processInfo.environment["DOUDUO_SELF_FIXTURE"] == "1"
+            #else
+            let selfFixture = false
+            #endif
+            if !selfFixture, !autoLoginShown, !(await DYLoginState.hasSession()) {
                 autoLoginShown = true
                 DYLiveModel.log("DDAPPLOGIN auto-show (no sessionid)")
                 showLogin = true
@@ -1842,7 +2200,21 @@ struct DYMineScreen: View {
             DYAppLoginScreen()
         }
         .onAppear { ensure(kind) }
-        .onChange(of: kind) { _, k in manageMsg = nil; ensure(k) }
+        .onChange(of: kind) { _, k in manageMsg = nil; managing = false; picked = []; Self.cachedKind = k; ensure(k) }
+        .confirmationDialog(confirmBatch?.title ?? "", isPresented: Binding(get: { confirmBatch != nil }, set: { if !$0 { confirmBatch = nil } }),
+                            titleVisibility: .visible) {
+            if let b = confirmBatch {
+                Button(b.button, role: b.destructive ? .destructive : nil) { Task { await runBatch(b) } }
+                    .accessibilityIdentifier("douyin.mine.batch.confirm")
+            }
+            Button("取消", role: .cancel) {}
+        } message: { Text(confirmBatch?.message ?? "") }
+        .sheet(item: Binding(get: { moveTarget.map { DYMoveRequest(ids: $0) } }, set: { moveTarget = $0?.ids })) { req in
+            DYCollectsFolderPicker(bridge: bridge, ids: req.ids) { msg in
+                manageMsg = msg; managing = false; picked = []
+            }
+        }
+
         .alert("清空观看历史？", isPresented: $confirmClearHistory) {
             Button("清空", role: .destructive) { Task { await clearHistory() } }
             Button("取消", role: .cancel) {}
@@ -1853,6 +2225,35 @@ struct DYMineScreen: View {
         }
         .fullScreenCover(item: $relations) { t in
             DYRelationsScreen(bridge: bridge, kind: t.kind, uid: t.user.uid, secUid: t.user.secUid, manageFollowers: true)
+        }
+        .fullScreenCover(isPresented: $showUpload, onDismiss: {
+            // 发完回来：作品数和「作品」栏重拉（抖音转码审核要一会儿，刚发的可能稍后才出现）
+            Task {
+                await refreshProfile()
+                models[.post] = nil; Self.cachedModels[.post] = nil
+                if kind == .post { ensure(.post) }
+            }
+        }) {
+            DYUploadScreen()
+        }
+    }
+
+    /// 下拉刷新（老板 2026-11-21）：资料（粉丝 / 获赞 / 作品数）和当前这一栏一起重拉；
+    /// 其它栏的缓存作废，切过去时再拉新的。拉不到就保留原内容。
+    private func pullRefresh(_ m: DYPagedModel) async {
+        DYLiveModel.log("DDMINE pull-refresh kind=\(kind.rawValue)")
+        async let profile: Void = refreshProfile()
+        await m.refresh()
+        await profile
+        let current = kind
+        for k in models.keys where k != current { models[k] = nil }
+        Self.cachedModels = models
+    }
+
+    private func refreshProfile() async {
+        if let u = try? await bridge.selfProfile() {
+            user = u; userErr = nil
+            Self.cachedUser = u
         }
     }
 
@@ -1883,12 +2284,84 @@ struct DYMineScreen: View {
         } catch { manageMsg = "没清掉：" + error.localizedDescription }
     }
 
+    /// 批量管理底栏：按当前栏给能做的操作
+    private func batchBar(_ m: DYPagedModel) -> some View {
+        let ids = m.items.filter { picked.contains($0.id) }.map(\.id)
+        return HStack(spacing: 10) {
+            switch kind {
+            case .post, .secret:
+                Menu {
+                    ForEach([DYWorkAction.makePublic, .friendsOnly, .makePrivate], id: \.rawValue) { a in
+                        Button(a.title) { confirmBatch = .works(a, ids) }
+                    }
+                } label: { Label("可见范围", systemImage: "eye") }
+                    .accessibilityIdentifier("douyin.mine.batch.visibility")
+                Button("删除", systemImage: "trash", role: .destructive) { confirmBatch = .works(.delete, ids) }
+                    .accessibilityIdentifier("douyin.mine.batch.delete")
+            case .like:
+                Button("取消喜欢", systemImage: "heart.slash", role: .destructive) { confirmBatch = .unlike(ids) }
+                    .accessibilityIdentifier("douyin.mine.batch.unlike")
+            case .collect:
+                Button("放进收藏夹", systemImage: "folder.badge.plus") { moveTarget = ids }
+                    .accessibilityIdentifier("douyin.mine.batch.move")
+                Button("取消收藏", systemImage: "star.slash", role: .destructive) { confirmBatch = .uncollect(ids) }
+                    .accessibilityIdentifier("douyin.mine.batch.uncollect")
+            default: EmptyView()
+            }
+        }
+        .font(.subheadline.weight(.semibold))
+        .buttonStyle(.bordered)
+        .disabled(ids.isEmpty || batchBusy)
+        .overlay { if batchBusy { ProgressView() } }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 10)
+        .background(.bar)
+    }
+
+    /// 执行批量操作：抖音确认了才从列表里拿掉；部分失败的留着并说明
+    private func runBatch(_ b: DYMineBatch) async {
+        guard !batchBusy, let m = models[kind] else { return }
+        batchBusy = true
+        defer { batchBusy = false }
+        let chosen = m.items.filter { b.ids.contains($0.id) }
+        do {
+            let r: DYBatchResult
+            switch b {
+            case .works(let a, let ids): r = try await bridge.manageMyWorks(ids, action: a)
+            case .unlike: r = try await bridge.cancelLikes(chosen)
+            case .uncollect: r = try await bridge.cancelCollects(chosen)
+            }
+            switch r.result {
+            case .ok:
+                let done = Set(b.ids).subtracting(r.failedIDs)
+                if b.removesFromList { m.items.removeAll { done.contains($0.id) } }
+                manageMsg = r.failedIDs.isEmpty ? "\(b.button)完成（\(done.count) 条）" : "\(done.count) 条成功，\(r.failedIDs.count) 条没处理掉"
+                picked = Set(r.failedIDs)
+                if r.failedIDs.isEmpty { managing = false }
+                if case .works(let a, _) = b {
+                    await refreshProfile()
+                    // 改了可见范围：作品 ⇄ 私密作品 两栏都可能变，另一栏下次进来重拉
+                    if a != .delete {
+                        m.items.removeAll { done.contains($0.id) && ((kind == .secret) != (a == .makePrivate)) }
+                        for other in [DYListKind.post, .secret] where other != kind { models[other] = nil; Self.cachedModels[other] = nil }
+                    }
+                }
+            case .notLoggedIn: manageMsg = "抖音未登录"
+            case .failed(let why): manageMsg = "\(b.button)失败：" + why
+            }
+        } catch { manageMsg = "\(b.button)失败：" + error.localizedDescription }
+    }
+
     private func ensure(_ k: DYListKind) {
         #if DEBUG
         if ProcessInfo.processInfo.environment["DOUDUO_COMMENT_ENTRY"] == "mine" { return }
         if ProcessInfo.processInfo.environment["DOUDUO_GRID_FIXTURE"] == "1" {
             guard models[k] == nil else { return }
-            let model = DYPagedModel { _ in (items: DYFeedModel.hashtagFixtures, cursor: "0", hasMore: false) }
+            // 夹具：每拉一次第一页记一笔，UI 测试据此确认下拉刷新真的重拉了
+            let model = DYPagedModel { cur in
+                DYLiveModel.log("DDMINE fixture fetch cursor=\(cur)")
+                return (items: DYFeedModel.hashtagFixtures, cursor: "0", hasMore: false)
+            }
             models[k] = model
             Task { await model.loadMore() }
             return
@@ -1904,6 +2377,7 @@ struct DYMineScreen: View {
             return r
         }
         models[k] = m
+        Self.cachedModels[k] = m
         Task { await m.loadMore() }
     }
 
@@ -1931,11 +2405,13 @@ private struct DYMineList: View {
     var showsPlayCount = false
     var removeTitle: String? = nil
     var onRemove: ((DYAweme) -> Void)? = nil
+    var onRefresh: (() async -> Void)? = nil
+    var selection: Binding<Set<String>>? = nil
     let onOpen: (Int) -> Void
     var body: some View {
         DYGrid(items: model.items, hasMore: model.hasMore, loading: model.loading, error: model.error,
                onLoadMore: { Task { await model.loadMore() } }, onOpen: onOpen, showsPlayCount: showsPlayCount,
-               removeTitle: removeTitle, onRemove: onRemove)
+               removeTitle: removeTitle, onRemove: onRemove, onRefresh: onRefresh, selection: selection)
     }
 }
 
@@ -2041,7 +2517,10 @@ struct DYAuthorScreen: View {
     let onWeb: (URL) -> Void
     var onClose: (() -> Void)? = nil
     var onWorkPresentationChange: ((Bool) -> Void)? = nil
+    /// 刚刚看过的作品 ID；不传就取打开主页那一刻正在播的视频（只有它确实是这个作者的作品才会标出来）
+    var focusAwemeID: String? = nil
     @Environment(\.dismiss) private var dismiss
+    @State private var recentID: String?
     @State private var user: DYUser?
     @State private var err: String?
     @State private var posts: [DYAweme] = []
@@ -2087,7 +2566,7 @@ struct DYAuthorScreen: View {
             DYGrid(items: posts, hasMore: hasMore, loading: loading, error: postErr, onLoadMore: { requestMore() }, onOpen: { i in
                 onWorkPresentationChange?(true)
                 player = DYAuthorPlay(playback: DYListPlayback(items: posts, start: i))
-            })
+            }, focusID: recentID)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .accessibilityIdentifier("douyin.author.works")
         }
@@ -2120,7 +2599,12 @@ struct DYAuthorScreen: View {
         } message: {
             Text(blocked ? "解除拉黑后，对方可以搜索到你，可以给你发私信" : "拉黑后，对方将无法搜索到你，也不能给你发私信")
         }
-        .fullScreenCover(item: $player, onDismiss: { onWorkPresentationChange?(false) }) { p in
+        .fullScreenCover(item: $player, onDismiss: {
+            onWorkPresentationChange?(false)
+            // 从主页点开作品看完回来：「刚刚看过」换成最后停留的那条
+            let last = DDNowPlaying.id
+            if !last.isEmpty, posts.contains(where: { $0.id == last }) { recentID = last }
+        }) { p in
             DYListPlayer(bridge: bridge, title: author.name.isEmpty ? "作品" : author.name, playback: p.playback,
                          loadMore: { await loadPosts() }, onAuthor: { _ in })
         }
@@ -2142,7 +2626,27 @@ struct DYAuthorScreen: View {
             }
             #endif
             _ = await loadPosts()
+            await locateRecent(s)
         }
+    }
+
+    /// 同抖音：刚刚看过的作品不在第一页时继续往下翻，直到翻到它（先核实它确实是这个作者的，别白翻）
+    private func locateRecent(_ sec: String) async {
+        let candidate = focusAwemeID ?? (DDNowPlaying.id.isEmpty ? nil : DDNowPlaying.id)
+        guard let id = candidate, !id.isEmpty else { return }
+        if posts.contains(where: { $0.id == id }) { recentID = id; DYLiveModel.log("DDAUTHOR recent found page=1 id=\(id)"); return }
+        guard hasMore, let item = try? await bridge.awemeDetail(id), item.author.secUid == sec else { return }
+        for page in 2...30 {
+            guard hasMore, !Task.isCancelled else { break }
+            while loading { try? await Task.sleep(for: .milliseconds(120)) }
+            _ = await loadPosts()
+            if posts.contains(where: { $0.id == id }) {
+                recentID = id
+                DYLiveModel.log("DDAUTHOR recent found page=\(page) id=\(id)")
+                return
+            }
+        }
+        DYLiveModel.log("DDAUTHOR recent not found id=\(id) n=\(posts.count)")
     }
 
     private func close() { if let onClose { onClose() } else { dismiss() } }
@@ -2420,7 +2924,10 @@ struct DYFollowFeed: View {
         if want { collected.insert(id) } else { collected.remove(id) }
         Task {
             let r = try? await bridge.favorite(id, add: want)
-            if case .ok = r { onToast(want ? "已收藏" : "已取消收藏"); return }
+            if case .ok = r {
+                if want { DYCollectPrompt.shared.show(id, owner: .feed) } else { onToast("已取消收藏") }
+                return
+            }
             if want { collected.remove(id) } else { collected.insert(id) }
             onToast("收藏失败")
         }
