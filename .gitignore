@@ -1,4 +1,8 @@
 build/
+
+# 本地下载的安装包及校验文件。
+/artifacts/ipa/
+
 DerivedData/
 *.xcarchive
 *.ipa
