@@ -780,6 +780,10 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
         return (p.items, p.cursor, p.hasMore, p.total)
     }
 
+    func cachedComments(_ id: String) -> DYCommentFirstPageCache.Page? {
+        commentFirstPages.snapshot(id)
+    }
+
     func preparedComments(_ id: String) async throws -> DYCommentFirstPageCache.Page {
         try await commentFirstPages.page(id) { [self] in
             try await fetchComments(id, cursor: 0)
@@ -5076,6 +5080,30 @@ struct DYCommentPanel: View {
         self.trailingInset = trailingInset
         self.horizontalStatus = horizontalStatus
         self.focus = focus?.awemeID == aweme.id ? focus : nil
+        // 已有评论直接作为首帧状态，面板与文字一起入场；消息定位仍走专用请求。
+        if self.focus == nil, let memory = DYCommentMemory.shared.take(aweme.id) {
+            _items = State(initialValue: memory.items)
+            _cursor = State(initialValue: memory.cursor)
+            _hasMore = State(initialValue: memory.hasMore)
+            _total = State(initialValue: memory.total)
+            _replies = State(initialValue: memory.replies)
+            _replyCursor = State(initialValue: memory.replyCursor)
+            _replyMore = State(initialValue: memory.replyMore)
+            _digged = State(initialValue: memory.digged)
+            _diggShown = State(initialValue: memory.diggShown)
+            _topVisibleID = State(initialValue: memory.topID)
+            _restoredFromMemory = State(initialValue: true)
+            if let top = memory.topID, top != memory.items.first?.id {
+                _restoringScroll = State(initialValue: true)
+                _pendingRestoreID = State(initialValue: top)
+            }
+        } else if self.focus == nil, let page = bridge.cachedComments(aweme.id) {
+            _items = State(initialValue: page.items)
+            _cursor = State(initialValue: page.cursor)
+            _hasMore = State(initialValue: page.hasMore && !page.items.isEmpty)
+            _total = State(initialValue: max(page.total, aweme.stats.comment))
+            _digged = State(initialValue: Set(page.items.filter { $0.userDigged == 1 }.map(\.id)))
+        }
     }
 
     private var dismissComments: (() -> Void)? {
@@ -5248,7 +5276,7 @@ struct DYCommentPanel: View {
             }
             .accessibilityIdentifier("douyin.comments.list")
             .modifier(DYCommentTopTracker(ids: items.map(\.id), top: $topVisibleID, paused: restoringScroll))
-            .onChange(of: pendingRestoreID) { _, id in restoreUpstreamCommentPosition(proxy, to: id) }
+            .onChange(of: pendingRestoreID, initial: true) { _, id in restoreUpstreamCommentPosition(proxy, to: id) }
             .scrollDismissesKeyboard(.interactively)
             .simultaneousGesture(TapGesture().onEnded { if inputFocused, !replyAutoKeyboard { inputFocused = false } })
             .onChange(of: highlight) { _, h in
@@ -5362,7 +5390,13 @@ struct DYCommentPanel: View {
                 .accessibilityIdentifier("douyin.comments.list")
                 .modifier(DYCommentTopTracker(ids: items.map(\.id), top: $topVisibleID, paused: restoringScroll))
                 .task(id: pendingRestoreID) {
-                    guard !showsCaption, let id = pendingRestoreID else { return }
+                    guard let id = pendingRestoreID else { return }
+                    // 简介面板从全文顶部开始，不能沿用普通评论的旧滚动位置。
+                    guard !showsCaption else {
+                        restoringScroll = false
+                        pendingRestoreID = nil
+                        return
+                    }
                     await restoreCommentPosition(proxy, to: id)
                 }
                 .scrollDismissesKeyboard(.interactively)
@@ -6132,13 +6166,16 @@ struct DYCommentPanel: View {
                 ? bridge.preparedComments(aweme.id)
                 : bridge.fetchComments(aweme.id, cursor: cursor, insert: ins))
             let seen = Set(items.map(\.id))
-            items.append(contentsOf: r.items.filter { !seen.contains($0.id) })
-            if let f = focus, first { applyFocus(f, page: r.items) }
-            for c in r.items where c.userDigged == 1 { digged.insert(c.id) }
-            cursor = r.cursor
-            hasMore = r.hasMore && !r.items.isEmpty
-            total = max(total, r.total, aweme.stats.comment)
-            error = nil
+            // 网络返回只更新内容，不继承面板入场动画再把整列文字弹起。
+            DYCommentPresentation.updateContent {
+                items.append(contentsOf: r.items.filter { !seen.contains($0.id) })
+                if let f = focus, first { applyFocus(f, page: r.items) }
+                for c in r.items where c.userDigged == 1 { digged.insert(c.id) }
+                cursor = r.cursor
+                hasMore = r.hasMore && !r.items.isEmpty
+                total = max(total, r.total, aweme.stats.comment)
+                error = nil
+            }
             #if DEBUG
             if ProcessInfo.processInfo.environment["DOUDUO_AUTOREPLY"] == "1", let c = items.first(where: { $0.replies > 0 }), replies[c.id] == nil {
                 Task { await loadReplies(c) }

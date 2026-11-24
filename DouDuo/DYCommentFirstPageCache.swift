@@ -9,10 +9,17 @@ final class DYCommentFirstPageCache {
         let token: UUID
         let created: Date
         let task: Task<Page, Error>
+        var completed: Page?
     }
     private var slots: [String: Slot] = [:]
     private var order: [String] = []
     private let limit = 20
+
+    /// 面板首帧同步读取已预加载的评论，避免先弹空面板、再插入文字。
+    func snapshot(_ id: String) -> Page? {
+        guard let slot = slots[id], Date().timeIntervalSince(slot.created) < 300 else { return nil }
+        return slot.completed
+    }
 
     func page(_ id: String, load: @escaping @MainActor () async throws -> Page) async throws -> Page {
         if let slot = slots[id], Date().timeIntervalSince(slot.created) < 300 {
@@ -25,7 +32,10 @@ final class DYCommentFirstPageCache {
         order.removeAll { $0 == id }; order.append(id)
         while order.count > limit { slots[order.removeFirst()] = nil }
         do {
-            return try await task.value
+            let page = try await task.value
+            // 切换账号或缓存被淘汰后，旧请求不得补回已完成的数据。
+            if slots[id]?.token == token { slots[id]?.completed = page }
+            return page
         } catch {
             if slots[id]?.token == token {
                 slots[id] = nil

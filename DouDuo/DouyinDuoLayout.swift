@@ -420,6 +420,13 @@ enum DYReservedNudge {
 // MARK: - Shared comments presentation
 
 enum DYCommentPresentation {
+    /// 数据填充不跟随面板入场动画，防止文字在面板出现后再次上移。
+    @MainActor static func updateContent(_ update: () -> Void) {
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction, update)
+    }
+
     /// Keep comments responsive without the default spring's long settling tail.
     static func animation(reduceMotion: Bool) -> Animation? {
         reduceMotion ? nil : .smooth(duration: 0.24)
@@ -639,11 +646,12 @@ struct DYInlineCommentOverlay: ViewModifier {
                                 .id(aweme.id)
                         }
                         .offset(y: placement.panelTop)
-                        .transition(reduceMotion ? .identity : .offset(y: placement.panelHeight))
+                        // 只给面板位移加动画，避免整个覆盖层的布局和评论文字一起参与补间。
+                        .transition((reduceMotion ? AnyTransition.identity : .offset(y: placement.panelHeight))
+                            .animation(DYCommentPresentation.animation(reduceMotion: reduceMotion)))
                         .accessibilityAddTraits(.isModal)
                     }
                 }
-                .animation(DYCommentPresentation.animation(reduceMotion: reduceMotion), value: placement != nil)
             }
     }
 }
